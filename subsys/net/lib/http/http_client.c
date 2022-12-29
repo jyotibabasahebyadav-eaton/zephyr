@@ -1,181 +1,184 @@
+/** @file
+ * @brief HTTP client API
+ *
+ * An API for applications to send HTTP requests
+ */
+
 /*
- * Copyright (c) 2017 Intel Corporation
+ * Copyright (c) 2019 Intel Corporation
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#if defined(CONFIG_NET_DEBUG_HTTP)
-#define SYS_LOG_DOMAIN "http/client"
-#define NET_LOG_ENABLED 1
-#endif
+#include <logging/log.h>
+LOG_MODULE_REGISTER(net_http, CONFIG_NET_HTTP_LOG_LEVEL);
 
+#include <kernel.h>
+#include <string.h>
+#include <strings.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <stdlib.h>
-#include <misc/printk.h>
 
-#include <net/net_core.h>
-#include <net/net_pkt.h>
-#include <net/dns_resolve.h>
+#include <net/net_ip.h>
+#include <net/socket.h>
+#include <net/http_client.h>
 
-#include <net/http.h>
+#include "net_private.h"
 
-#define BUF_ALLOC_TIMEOUT K_SECONDS(1)
+#define HTTP_CONTENT_LEN_SIZE 6
+#define MAX_SEND_BUF_LEN 192
 
-/* HTTP client defines */
-#define HTTP_EOF           "\r\n\r\n"
-
-#define HTTP_CONTENT_TYPE  "Content-Type: "
-#define HTTP_CONT_LEN_SIZE 64
-
-struct waiter {
-	struct http_client_ctx *ctx;
-	struct k_sem wait;
-};
-
-int http_request(struct net_context *net_ctx, struct http_client_request *req,
-		 s32_t timeout)
+static ssize_t sendall(int sock, const void *buf, size_t len)
 {
-	const char *method = http_method_str(req->method);
-	struct net_pkt *pkt;
-	int ret = -ENOMEM;
+	while (len) {
+		ssize_t out_len = zsock_send(sock, buf, len, 0);
 
-	pkt = net_pkt_get_tx(net_ctx, timeout);
-	if (!pkt) {
-		return -ENOMEM;
-	}
-
-	if (!net_pkt_append_all(pkt, strlen(method), (u8_t *)method,
-				timeout)) {
-		goto out;
-	}
-
-	/* Space after method string. */
-	if (!net_pkt_append_all(pkt, 1, (u8_t *)" ", timeout)) {
-		goto out;
-	}
-
-	if (!net_pkt_append_all(pkt, strlen(req->url), (u8_t *)req->url,
-				timeout)) {
-		goto out;
-	}
-
-	if (!net_pkt_append_all(pkt, strlen(req->protocol),
-				(u8_t *)req->protocol, timeout)) {
-		goto out;
-	}
-
-	if (req->host) {
-		if (!net_pkt_append_all(pkt, strlen(req->host),
-					(u8_t *)req->host, timeout)) {
-			goto out;
+		if (out_len < 0) {
+			return -errno;
 		}
 
-		if (!net_pkt_append_all(pkt, strlen(HTTP_CRLF),
-					(u8_t *)HTTP_CRLF, timeout)) {
-			goto out;
-		}
+		buf = (const char *)buf + out_len;
+		len -= out_len;
 	}
 
-	if (req->header_fields) {
-		if (!net_pkt_append_all(pkt, strlen(req->header_fields),
-					(u8_t *)req->header_fields,
-					timeout)) {
-			goto out;
-		}
+	return 0;
+}
+
+static int http_send_data(int sock, char *send_buf,
+			  size_t send_buf_max_len, size_t *send_buf_pos,
+			  ...)
+{
+	const char *data;
+	va_list va;
+	int ret, end_of_send = *send_buf_pos;
+	int end_of_data, remaining_len;
+
+	va_start(va, send_buf_pos);
+
+	data = va_arg(va, const char *);
+
+	while (data) {
+		end_of_data = 0;
+
+		do {
+			int to_be_copied;
+
+			remaining_len = strlen(data + end_of_data);
+			to_be_copied = send_buf_max_len - end_of_send;
+
+			if (remaining_len > to_be_copied) {
+				strncpy(send_buf + end_of_send,
+					data + end_of_data,
+					to_be_copied);
+
+				end_of_send += to_be_copied;
+				end_of_data += to_be_copied;
+				remaining_len -= to_be_copied;
+
+				LOG_HEXDUMP_DBG(send_buf, end_of_send,
+						"Data to send");
+
+				ret = sendall(sock, send_buf, end_of_send);
+				if (ret < 0) {
+					NET_DBG("Cannot send %d bytes (%d)",
+						end_of_send, ret);
+					goto err;
+				}
+
+				end_of_send = 0;
+				continue;
+			} else {
+				strncpy(send_buf + end_of_send,
+					data + end_of_data,
+					remaining_len);
+				end_of_send += remaining_len;
+				remaining_len = 0;
+			}
+		} while (remaining_len > 0);
+
+		data = va_arg(va, const char *);
 	}
 
-	if (req->content_type_value) {
-		if (!net_pkt_append_all(pkt, strlen(HTTP_CONTENT_TYPE),
-					(u8_t *)HTTP_CONTENT_TYPE,
-					timeout)) {
-			goto out;
-		}
+	va_end(va);
 
-		if (!net_pkt_append_all(pkt, strlen(req->content_type_value),
-					(u8_t *)req->content_type_value,
-					timeout)) {
-			goto out;
-		}
+	if (end_of_send > (int)send_buf_max_len) {
+		NET_ERR("Sending overflow (%d > %zd)", end_of_send,
+			send_buf_max_len);
+		return -EMSGSIZE;
 	}
 
-	if (req->payload && req->payload_size) {
-		char content_len_str[HTTP_CONT_LEN_SIZE];
+	*send_buf_pos = end_of_send;
 
-		ret = snprintk(content_len_str, HTTP_CONT_LEN_SIZE,
-			       HTTP_CRLF "Content-Length: %u"
-			       HTTP_CRLF HTTP_CRLF,
-			       req->payload_size);
-		if (ret <= 0 || ret >= HTTP_CONT_LEN_SIZE) {
-			ret = -ENOMEM;
-			goto out;
-		}
+	return end_of_send;
 
-		if (!net_pkt_append_all(pkt, ret, (u8_t *)content_len_str,
-					timeout)) {
-			ret = -ENOMEM;
-			goto out;
-		}
-
-		if (!net_pkt_append_all(pkt, req->payload_size,
-					(u8_t *)req->payload,
-					timeout)) {
-			ret = -ENOMEM;
-			goto out;
-		}
-	} else {
-		if (!net_pkt_append_all(pkt, strlen(HTTP_EOF),
-					(u8_t *)HTTP_EOF,
-					timeout)) {
-			goto out;
-		}
-	}
-
-	return net_context_send(pkt, NULL, timeout, NULL, NULL);
-
-out:
-	net_pkt_unref(pkt);
+err:
+	va_end(va);
 
 	return ret;
 }
 
+static int http_flush_data(int sock, const char *send_buf, size_t send_buf_len)
+{
+	LOG_HEXDUMP_DBG(send_buf, send_buf_len, "Data to send");
+
+	return sendall(sock, send_buf, send_buf_len);
+}
+
 static void print_header_field(size_t len, const char *str)
 {
-#if defined(CONFIG_NET_DEBUG_HTTP)
+	if (IS_ENABLED(CONFIG_NET_HTTP_LOG_LEVEL_DBG)) {
 #define MAX_OUTPUT_LEN 128
-	char output[MAX_OUTPUT_LEN];
+		char output[MAX_OUTPUT_LEN];
 
-	/* The value of len does not count \0 so we need to increase it
-	 * by one.
-	 */
-	if ((len + 1) > sizeof(output)) {
-		len = sizeof(output) - 1;
+		/* The value of len does not count \0 so we need to increase it
+		 * by one.
+		 */
+		if ((len + 1) > sizeof(output)) {
+			len = sizeof(output) - 1;
+		}
+
+		snprintk(output, len + 1, "%s", str);
+
+		NET_DBG("[%zd] %s", len, log_strdup(output));
 	}
-
-	snprintk(output, len + 1, "%s", str);
-
-	NET_DBG("[%zd] %s", len, output);
-#endif
 }
 
 static int on_url(struct http_parser *parser, const char *at, size_t length)
 {
-	ARG_UNUSED(parser);
-
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
 	print_header_field(length, at);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_url) {
+		req->internal.response.http_cb->on_url(parser, at, length);
+	}
 
 	return 0;
 }
 
 static int on_status(struct http_parser *parser, const char *at, size_t length)
 {
-	struct http_client_ctx *ctx;
-	u16_t len;
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+	uint16_t len;
 
-	ctx = CONTAINER_OF(parser, struct http_client_ctx, parser);
-	len = min(length, sizeof(ctx->rsp.http_status) - 1);
-	memcpy(ctx->rsp.http_status, at, len);
-	ctx->rsp.http_status[len] = 0;
+	len = MIN(length, sizeof(req->internal.response.http_status) - 1);
+	memcpy(req->internal.response.http_status, at, len);
+	req->internal.response.http_status[len] = 0;
+	req->internal.response.http_status_code =
+		(uint16_t)parser->status_code;
 
-	NET_DBG("HTTP response status %s", ctx->rsp.http_status);
+	NET_DBG("HTTP response status %d %s", parser->status_code,
+		log_strdup(req->internal.response.http_status));
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_status) {
+		req->internal.response.http_cb->on_status(parser, at, length);
+	}
 
 	return 0;
 }
@@ -183,18 +186,24 @@ static int on_status(struct http_parser *parser, const char *at, size_t length)
 static int on_header_field(struct http_parser *parser, const char *at,
 			   size_t length)
 {
-	char *content_len = "Content-Length";
-	struct http_client_ctx *ctx;
-	u16_t len;
-
-	ctx = CONTAINER_OF(parser, struct http_client_ctx, parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+	const char *content_len = "Content-Length";
+	uint16_t len;
 
 	len = strlen(content_len);
-	if (length >= len && memcmp(at, content_len, len) == 0) {
-		ctx->rsp.cl_present = true;
+	if (length >= len && strncasecmp(at, content_len, len) == 0) {
+		req->internal.response.cl_present = true;
 	}
 
 	print_header_field(length, at);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_header_field) {
+		req->internal.response.http_cb->on_header_field(parser, at,
+								length);
+	}
 
 	return 0;
 }
@@ -204,26 +213,33 @@ static int on_header_field(struct http_parser *parser, const char *at,
 static int on_header_value(struct http_parser *parser, const char *at,
 			   size_t length)
 {
-	struct http_client_ctx *ctx;
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
 	char str[MAX_NUM_DIGITS];
 
-	ctx = CONTAINER_OF(parser, struct http_client_ctx, parser);
-
-	if (ctx->rsp.cl_present) {
+	if (req->internal.response.cl_present) {
 		if (length <= MAX_NUM_DIGITS - 1) {
 			long int num;
 
 			memcpy(str, at, length);
 			str[length] = 0;
+
 			num = strtol(str, NULL, 10);
 			if (num == LONG_MIN || num == LONG_MAX) {
 				return -EINVAL;
 			}
 
-			ctx->rsp.content_length = num;
+			req->internal.response.content_length = num;
 		}
 
-		ctx->rsp.cl_present = false;
+		req->internal.response.cl_present = false;
+	}
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_header_value) {
+		req->internal.response.http_cb->on_header_value(parser, at,
+								length);
 	}
 
 	print_header_field(length, at);
@@ -233,32 +249,24 @@ static int on_header_value(struct http_parser *parser, const char *at,
 
 static int on_body(struct http_parser *parser, const char *at, size_t length)
 {
-	struct http_client_ctx *ctx = CONTAINER_OF(parser,
-						   struct http_client_ctx,
-						   parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
 
-	ctx->rsp.body_found = 1;
-	ctx->rsp.processed += length;
+	req->internal.response.body_found = 1;
+	req->internal.response.processed += length;
 
-	NET_DBG("Processed %zd length %zd", ctx->rsp.processed, length);
+	NET_DBG("Processed %zd length %zd", req->internal.response.processed,
+		length);
 
-	if (!ctx->rsp.body_start) {
-		ctx->rsp.body_start = (u8_t *)at;
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_body) {
+		req->internal.response.http_cb->on_body(parser, at, length);
 	}
 
-	if (ctx->rsp.cb) {
-		NET_DBG("Calling callback for partitioned %zd len data",
-			ctx->rsp.data_len);
-
-		ctx->rsp.cb(ctx,
-			    ctx->rsp.response_buf,
-			    ctx->rsp.response_buf_len,
-			    ctx->rsp.data_len,
-			    HTTP_DATA_MORE,
-			    ctx->req.user_data);
-
-		/* Re-use the result buffer and start to fill it again */
-		ctx->rsp.data_len = 0;
+	if (!req->internal.response.body_start &&
+	    (uint8_t *)at != (uint8_t *)req->internal.response.recv_buf) {
+		req->internal.response.body_start = (uint8_t *)at;
 	}
 
 	return 0;
@@ -266,18 +274,22 @@ static int on_body(struct http_parser *parser, const char *at, size_t length)
 
 static int on_headers_complete(struct http_parser *parser)
 {
-	struct http_client_ctx *ctx = CONTAINER_OF(parser,
-						   struct http_client_ctx,
-						   parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_headers_complete) {
+		req->internal.response.http_cb->on_headers_complete(parser);
+	}
 
 	if (parser->status_code >= 500 && parser->status_code < 600) {
 		NET_DBG("Status %d, skipping body", parser->status_code);
-
 		return 1;
 	}
 
-	if ((ctx->req.method == HTTP_HEAD || ctx->req.method == HTTP_OPTIONS)
-	    && ctx->rsp.content_length > 0) {
+	if ((req->method == HTTP_HEAD || req->method == HTTP_OPTIONS) &&
+	    req->internal.response.content_length > 0) {
 		NET_DBG("No body expected");
 		return 1;
 	}
@@ -289,572 +301,389 @@ static int on_headers_complete(struct http_parser *parser)
 
 static int on_message_begin(struct http_parser *parser)
 {
-#if defined(CONFIG_NET_DEBUG_HTTP)
-	struct http_client_ctx *ctx = CONTAINER_OF(parser,
-						   struct http_client_ctx,
-						   parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_message_begin) {
+		req->internal.response.http_cb->on_message_begin(parser);
+	}
 
 	NET_DBG("-- HTTP %s response (headers) --",
-		http_method_str(ctx->req.method));
-#else
-	ARG_UNUSED(parser);
-#endif
+		http_method_str(req->method));
+
 	return 0;
 }
 
 static int on_message_complete(struct http_parser *parser)
 {
-	struct http_client_ctx *ctx = CONTAINER_OF(parser,
-						   struct http_client_ctx,
-						   parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
 
-	NET_DBG("-- HTTP %s response (complete) --",
-		http_method_str(ctx->req.method));
-
-	if (ctx->rsp.cb) {
-		ctx->rsp.cb(ctx,
-			    ctx->rsp.response_buf,
-			    ctx->rsp.response_buf_len,
-			    ctx->rsp.data_len,
-			    HTTP_DATA_FINAL,
-			    ctx->req.user_data);
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_message_complete) {
+		req->internal.response.http_cb->on_message_complete(parser);
 	}
 
-	k_sem_give(&ctx->req.wait);
+	NET_DBG("-- HTTP %s response (complete) --",
+		http_method_str(req->method));
+
+	req->internal.response.message_complete = 1;
 
 	return 0;
 }
 
 static int on_chunk_header(struct http_parser *parser)
 {
-	ARG_UNUSED(parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_chunk_header) {
+		req->internal.response.http_cb->on_chunk_header(parser);
+	}
 
 	return 0;
 }
 
 static int on_chunk_complete(struct http_parser *parser)
 {
-	ARG_UNUSED(parser);
+	struct http_request *req = CONTAINER_OF(parser,
+						struct http_request,
+						internal.parser);
+
+	if (req->internal.response.http_cb &&
+	    req->internal.response.http_cb->on_chunk_complete) {
+		req->internal.response.http_cb->on_chunk_complete(parser);
+	}
 
 	return 0;
 }
 
-static void http_receive_cb(struct http_client_ctx *ctx,
-			    struct net_pkt *pkt)
+static void http_client_init_parser(struct http_parser *parser,
+				    struct http_parser_settings *settings)
 {
-	size_t start = ctx->rsp.data_len;
-	size_t len = 0;
-	struct net_buf *frag;
-	int header_len;
+	http_parser_init(parser, HTTP_RESPONSE);
 
-	if (!pkt) {
-		return;
+	settings->on_body = on_body;
+	settings->on_chunk_complete = on_chunk_complete;
+	settings->on_chunk_header = on_chunk_header;
+	settings->on_headers_complete = on_headers_complete;
+	settings->on_header_field = on_header_field;
+	settings->on_header_value = on_header_value;
+	settings->on_message_begin = on_message_begin;
+	settings->on_message_complete = on_message_complete;
+	settings->on_status = on_status;
+	settings->on_url = on_url;
+}
+
+static int http_wait_data(int sock, struct http_request *req)
+{
+	int total_received = 0;
+	size_t offset = 0;
+	int received, ret;
+
+	do {
+		received = zsock_recv(sock, req->internal.response.recv_buf + offset,
+				      req->internal.response.recv_buf_len - offset,
+				      0);
+		if (received == 0) {
+			/* Connection closed */
+			LOG_DBG("Connection closed");
+			ret = total_received;
+
+			if (req->internal.response.cb) {
+				NET_DBG("Calling callback for closed connection");
+
+				req->internal.response.cb(&req->internal.response,
+							  HTTP_DATA_FINAL,
+							  req->internal.user_data);
+			}
+
+			break;
+		} else if (received < 0) {
+			/* Socket error */
+			LOG_DBG("Connection error (%d)", errno);
+			ret = -errno;
+			break;
+		} else {
+			req->internal.response.data_len += received;
+
+			(void)http_parser_execute(
+				&req->internal.parser,
+				&req->internal.parser_settings,
+				req->internal.response.recv_buf + offset,
+				received);
+		}
+
+		total_received += received;
+		offset += received;
+
+		if (offset >= req->internal.response.recv_buf_len) {
+			offset = 0;
+		}
+
+		if (req->internal.response.cb) {
+			bool notify = false;
+			enum http_final_call event;
+
+			if (req->internal.response.message_complete) {
+				NET_DBG("Calling callback for %zd len data",
+					req->internal.response.data_len);
+
+				notify = true;
+				event = HTTP_DATA_FINAL;
+			} else if (offset == 0) {
+				NET_DBG("Calling callback for partitioned %zd len data",
+					req->internal.response.data_len);
+
+				notify = true;
+				event = HTTP_DATA_MORE;
+			}
+
+			if (notify) {
+				req->internal.response.cb(&req->internal.response,
+							  event,
+							  req->internal.user_data);
+
+				/* Re-use the result buffer and start to fill it again */
+				req->internal.response.data_len = 0;
+				req->internal.response.body_start = NULL;
+			}
+		}
+
+		if (req->internal.response.message_complete) {
+			ret = total_received;
+			break;
+		}
+
+	} while (true);
+
+	return ret;
+}
+
+static void http_timeout(struct k_work *work)
+{
+	struct http_client_internal_data *data =
+		CONTAINER_OF(work, struct http_client_internal_data, work);
+
+	(void)zsock_close(data->sock);
+}
+
+int http_client_req(int sock, struct http_request *req,
+		    int32_t timeout, void *user_data)
+{
+	/* Utilize the network usage by sending data in bigger blocks */
+	char send_buf[MAX_SEND_BUF_LEN];
+	const size_t send_buf_max_len = sizeof(send_buf);
+	size_t send_buf_pos = 0;
+	int total_sent = 0;
+	int ret, total_recv, i;
+	const char *method;
+
+	if (sock < 0 || req == NULL || req->response == NULL ||
+	    req->recv_buf == NULL || req->recv_buf_len == 0) {
+		return -EINVAL;
 	}
 
-	/* Get rid of possible IP headers in the first fragment. */
-	frag = pkt->frags;
+	memset(&req->internal.response, 0, sizeof(req->internal.response));
 
-	header_len = net_pkt_appdata(pkt) - frag->data;
+	req->internal.response.http_cb = req->http_cb;
+	req->internal.response.cb = req->response;
+	req->internal.response.recv_buf = req->recv_buf;
+	req->internal.response.recv_buf_len = req->recv_buf_len;
+	req->internal.user_data = user_data;
+	req->internal.sock = sock;
+	req->internal.timeout = SYS_TIMEOUT_MS(timeout);
 
-	NET_DBG("Received %d bytes data", net_pkt_appdatalen(pkt));
+	method = http_method_str(req->method);
 
-	/* After this pull, the frag->data points directly to application data.
-	 */
-	net_buf_pull(frag, header_len);
+	ret = http_send_data(sock, send_buf, send_buf_max_len, &send_buf_pos,
+			     method, " ", req->url, " ", req->protocol,
+			     HTTP_CRLF, NULL);
+	if (ret < 0) {
+		goto out;
+	}
 
-	while (frag) {
-		/* If this fragment cannot be copied to result buf,
-		 * then parse what we have which will cause the callback to be
-		 * called in function on_body(), and continue copying.
-		 */
-		if (ctx->rsp.data_len + frag->len > ctx->rsp.response_buf_len) {
+	total_sent += ret;
 
-			/* If the caller has not supplied a callback, then
-			 * we cannot really continue if the response buffer
-			 * overflows. Set the data_len to mark how many bytes
-			 * should be needed in the response_buf.
-			 */
-			if (!ctx->rsp.cb) {
-				ctx->rsp.data_len = net_pkt_get_len(pkt);
+	if (req->port) {
+		ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, "Host", ": ", req->host,
+				     ":", req->port, HTTP_CRLF, NULL);
+
+		if (ret < 0) {
+			goto out;
+		}
+
+		total_sent += ret;
+	} else {
+		ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, "Host", ": ", req->host,
+				     HTTP_CRLF, NULL);
+
+		if (ret < 0) {
+			goto out;
+		}
+
+		total_sent += ret;
+	}
+
+	if (req->optional_headers_cb) {
+		ret = http_flush_data(sock, send_buf, send_buf_pos);
+		if (ret < 0) {
+			goto out;
+		}
+
+		send_buf_pos = 0;
+		total_sent += ret;
+
+		ret = req->optional_headers_cb(sock, req, user_data);
+		if (ret < 0) {
+			goto out;
+		}
+
+		total_sent += ret;
+	} else {
+		for (i = 0; req->optional_headers && req->optional_headers[i];
+		     i++) {
+			ret = http_send_data(sock, send_buf, send_buf_max_len,
+					     &send_buf_pos,
+					     req->optional_headers[i], NULL);
+			if (ret < 0) {
 				goto out;
 			}
 
-			http_parser_execute(&ctx->parser,
-					    &ctx->settings,
-					    ctx->rsp.response_buf + start,
-					    len);
+			total_sent += ret;
+		}
+	}
 
-			ctx->rsp.data_len = 0;
-			len = 0;
-			start = 0;
+	for (i = 0; req->header_fields && req->header_fields[i]; i++) {
+		ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, req->header_fields[i],
+				     NULL);
+		if (ret < 0) {
+			goto out;
 		}
 
-		memcpy(ctx->rsp.response_buf + ctx->rsp.data_len,
-		       frag->data, frag->len);
-
-		ctx->rsp.data_len += frag->len;
-		len += frag->len;
-		frag = frag->frags;
+		total_sent += ret;
 	}
 
-out:
-	/* The parser's error can be catched outside, reading the
-	 * http_errno struct member
-	 */
-	http_parser_execute(&ctx->parser, &ctx->settings,
-			    ctx->rsp.response_buf + start, len);
-
-	net_pkt_unref(pkt);
-}
-
-int client_reset(struct http_client_ctx *ctx)
-{
-	http_parser_init(&ctx->parser, HTTP_RESPONSE);
-
-	memset(ctx->rsp.http_status, 0, sizeof(ctx->rsp.http_status));
-
-	ctx->rsp.cl_present = 0;
-	ctx->rsp.content_length = 0;
-	ctx->rsp.processed = 0;
-	ctx->rsp.body_found = 0;
-	ctx->rsp.body_start = NULL;
-
-	memset(ctx->rsp.response_buf, 0, ctx->rsp.response_buf_len);
-	ctx->rsp.data_len = 0;
-
-	return 0;
-}
-
-static void tcp_disconnect(struct http_client_ctx *ctx)
-{
-	if (ctx->tcp.ctx) {
-		net_context_put(ctx->tcp.ctx);
-		ctx->tcp.ctx = NULL;
-	}
-}
-
-static void recv_cb(struct net_context *net_ctx, struct net_pkt *pkt,
-		    int status, void *data)
-{
-	struct http_client_ctx *ctx = data;
-
-	ARG_UNUSED(net_ctx);
-
-	if (status) {
-		return;
-	}
-
-	if (!pkt || net_pkt_appdatalen(pkt) == 0) {
-		goto out;
-	}
-
-	/* receive_cb must take ownership of the received packet */
-	if (ctx->tcp.receive_cb) {
-		ctx->tcp.receive_cb(ctx, pkt);
-		return;
-	}
-
-out:
-	net_pkt_unref(pkt);
-}
-
-static int get_local_addr(struct http_client_ctx *ctx)
-{
-	if (ctx->tcp.local.family == AF_INET6) {
-#if defined(CONFIG_NET_IPV6)
-		struct in6_addr *dst = &net_sin6(&ctx->tcp.remote)->sin6_addr;
-
-		net_ipaddr_copy(&net_sin6(&ctx->tcp.local)->sin6_addr,
-				net_if_ipv6_select_src_addr(NULL, dst));
-#else
-		return -EPFNOSUPPORT;
-#endif
-	} else if (ctx->tcp.local.family == AF_INET) {
-#if defined(CONFIG_NET_IPV4)
-		struct net_if *iface = net_if_get_default();
-
-		/* For IPv4 we take the first address in the interface */
-		net_ipaddr_copy(&net_sin(&ctx->tcp.local)->sin_addr,
-				&iface->ipv4.unicast[0].address.in_addr);
-#else
-		return -EPFNOSUPPORT;
-#endif
-	}
-
-	return 0;
-}
-
-static int tcp_connect(struct http_client_ctx *ctx)
-{
-	socklen_t addrlen = sizeof(struct sockaddr_in);
-	int ret;
-
-	if (ctx->tcp.remote.family == AF_INET6) {
-		addrlen = sizeof(struct sockaddr_in6);
-	}
-
-	ret = get_local_addr(ctx);
-	if (ret < 0) {
-		NET_DBG("Cannot get local address (%d)", ret);
-		return ret;
-	}
-
-	ret = net_context_get(ctx->tcp.remote.family, SOCK_STREAM,
-			      IPPROTO_TCP, &ctx->tcp.ctx);
-	if (ret) {
-		NET_DBG("Get context error (%d)", ret);
-		return ret;
-	}
-
-	ret = net_context_bind(ctx->tcp.ctx, &ctx->tcp.local,
-			       addrlen);
-	if (ret) {
-		NET_DBG("Bind error (%d)", ret);
-		goto out;
-	}
-
-	ret = net_context_connect(ctx->tcp.ctx,
-				  &ctx->tcp.remote, addrlen,
-				  NULL, ctx->tcp.timeout, NULL);
-	if (ret) {
-		NET_DBG("Connect error (%d)", ret);
-		goto out;
-	}
-
-	return net_context_recv(ctx->tcp.ctx, recv_cb, K_NO_WAIT, ctx);
-
-out:
-	net_context_put(ctx->tcp.ctx);
-
-	return ret;
-}
-
-#if defined(CONFIG_NET_DEBUG_HTTP)
-static void sprint_addr(char *buf, int len,
-			sa_family_t family,
-			struct sockaddr *addr)
-{
-	if (family == AF_INET6) {
-		net_addr_ntop(AF_INET6, &net_sin6(addr)->sin6_addr, buf, len);
-	} else if (family == AF_INET) {
-		net_addr_ntop(AF_INET, &net_sin(addr)->sin_addr, buf, len);
-	} else {
-		NET_DBG("Invalid protocol family");
-	}
-}
-#endif
-
-static inline void print_info(struct http_client_ctx *ctx,
-				enum http_method method)
-{
-#if defined(CONFIG_NET_DEBUG_HTTP)
-	char local[NET_IPV6_ADDR_LEN];
-	char remote[NET_IPV6_ADDR_LEN];
-
-	sprint_addr(local, NET_IPV6_ADDR_LEN, ctx->tcp.local.family,
-		    &ctx->tcp.local);
-
-	sprint_addr(remote, NET_IPV6_ADDR_LEN, ctx->tcp.remote.family,
-		    &ctx->tcp.remote);
-
-	NET_DBG("HTTP %s (%s) %s -> %s port %d",
-		http_method_str(method), ctx->req.host, local, remote,
-		ntohs(net_sin(&ctx->tcp.remote)->sin_port));
-#endif
-}
-
-int http_client_send_req(struct http_client_ctx *ctx,
-			 struct http_client_request *req,
-			 http_response_cb_t cb,
-			 u8_t *response_buf,
-			 size_t response_buf_len,
-			 void *user_data,
-			 s32_t timeout)
-{
-	int ret;
-
-	if (!response_buf || response_buf_len == 0) {
-		return -EINVAL;
-	}
-
-	client_reset(ctx);
-
-	ret = tcp_connect(ctx);
-	if (ret) {
-		NET_DBG("TCP connect error (%d)", ret);
-		return ret;
-	}
-
-	if (!req->host) {
-		req->host = ctx->server;
-	}
-
-	ctx->req.host = req->host;
-	ctx->req.method = req->method;
-	ctx->req.user_data = user_data;
-
-	ctx->rsp.cb = cb;
-	ctx->rsp.response_buf = response_buf;
-	ctx->rsp.response_buf_len = response_buf_len;
-
-	print_info(ctx, ctx->req.method);
-
-	ret = http_request(ctx->tcp.ctx, req, BUF_ALLOC_TIMEOUT);
-	if (ret) {
-		NET_DBG("Send error (%d)", ret);
-		goto out;
-	}
-
-	if (timeout != 0 && k_sem_take(&ctx->req.wait, timeout)) {
-		ret = -ETIMEDOUT;
-		goto out;
-	}
-
-	if (timeout == 0) {
-		return -EINPROGRESS;
-	}
-
-	return 0;
-
-out:
-	tcp_disconnect(ctx);
-
-	return ret;
-}
-
-#if defined(CONFIG_DNS_RESOLVER)
-static void dns_cb(enum dns_resolve_status status,
-		   struct dns_addrinfo *info,
-		   void *user_data)
-{
-	struct waiter *waiter = user_data;
-	struct http_client_ctx *ctx = waiter->ctx;
-
-	if (!(status == DNS_EAI_INPROGRESS && info)) {
-		return;
-	}
-
-	if (info->ai_family == AF_INET) {
-#if defined(CONFIG_NET_IPV4)
-		net_ipaddr_copy(&net_sin(&ctx->tcp.remote)->sin_addr,
-				&net_sin(&info->ai_addr)->sin_addr);
-#else
-		goto out;
-#endif
-	} else if (info->ai_family == AF_INET6) {
-#if defined(CONFIG_NET_IPV6)
-		net_ipaddr_copy(&net_sin6(&ctx->tcp.remote)->sin6_addr,
-				&net_sin6(&info->ai_addr)->sin6_addr);
-#else
-		goto out;
-#endif
-	} else {
-		goto out;
-	}
-
-	ctx->tcp.remote.family = info->ai_family;
-
-out:
-	k_sem_give(&waiter->wait);
-}
-
-#define DNS_WAIT K_SECONDS(2)
-#define DNS_WAIT_SEM (DNS_WAIT + K_SECONDS(1))
-
-static int resolve_name(struct http_client_ctx *ctx,
-			const char *server,
-			enum dns_query_type type)
-{
-	struct waiter dns_waiter;
-	int ret;
-
-	dns_waiter.ctx = ctx;
-	k_sem_init(&dns_waiter.wait, 0, 1);
-
-	ret = dns_get_addr_info(server, type, &ctx->dns_id, dns_cb,
-				&dns_waiter, DNS_WAIT);
-	if (ret < 0) {
-		NET_ERR("Cannot resolve %s (%d)", server, ret);
-		ctx->dns_id = 0;
-		return ret;
-	}
-
-	/* Wait a little longer for the DNS to finish so that
-	 * the DNS will timeout before the semaphore.
-	 */
-	if (k_sem_take(&dns_waiter.wait, DNS_WAIT_SEM)) {
-		NET_ERR("Timeout while resolving %s", server);
-		ctx->dns_id = 0;
-		return -ETIMEDOUT;
-	}
-
-	ctx->dns_id = 0;
-
-	if (ctx->tcp.remote.family == AF_UNSPEC) {
-		return -EINVAL;
-	}
-
-	return 0;
-}
-#endif /* CONFIG_DNS_RESOLVER */
-
-static inline int set_remote_addr(struct http_client_ctx *ctx,
-				  const char *server, u16_t server_port)
-{
-	int ret;
-
-#if defined(CONFIG_NET_IPV6) && !defined(CONFIG_NET_IPV4)
-	ret = net_addr_pton(AF_INET6, server,
-			    &net_sin6(&ctx->tcp.remote)->sin6_addr);
-	if (ret < 0) {
-		/* Could be hostname, try DNS if configured. */
-#if !defined(CONFIG_DNS_RESOLVER)
-		NET_ERR("Invalid IPv6 address %s", server);
-		return -EINVAL;
-#else
-		ret = resolve_name(ctx, server, DNS_QUERY_TYPE_AAAA);
+	if (req->content_type_value) {
+		ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, "Content-Type", ": ",
+				     req->content_type_value, HTTP_CRLF, NULL);
 		if (ret < 0) {
-			NET_ERR("Cannot resolve %s (%d)", server, ret);
-			return ret;
+			goto out;
 		}
-#endif
+
+		total_sent += ret;
 	}
 
-	net_sin6(&ctx->tcp.remote)->sin6_port = htons(server_port);
-	net_sin6(&ctx->tcp.remote)->sin6_family = AF_INET6;
-#endif /* IPV6 && !IPV4 */
+	if (req->payload || req->payload_cb) {
+		if (req->payload_len) {
+			char content_len_str[HTTP_CONTENT_LEN_SIZE];
 
-#if defined(CONFIG_NET_IPV4) && !defined(CONFIG_NET_IPV6)
-	ret = net_addr_pton(AF_INET, server,
-			    &net_sin(&ctx->tcp.remote)->sin_addr);
-	if (ret < 0) {
-		/* Could be hostname, try DNS if configured. */
-#if !defined(CONFIG_DNS_RESOLVER)
-		NET_ERR("Invalid IPv4 address %s", server);
-		return -EINVAL;
-#else
-		ret = resolve_name(ctx, server, DNS_QUERY_TYPE_A);
-		if (ret < 0) {
-			NET_ERR("Cannot resolve %s (%d)", server, ret);
-			return ret;
-		}
-#endif
-	}
-
-	net_sin(&ctx->tcp.remote)->sin_port = htons(server_port);
-	net_sin(&ctx->tcp.remote)->sin_family = AF_INET;
-#endif /* IPV6 && !IPV4 */
-
-#if defined(CONFIG_NET_IPV4) && defined(CONFIG_NET_IPV6)
-	ret = net_addr_pton(AF_INET, server,
-			    &net_sin(&ctx->tcp.remote)->sin_addr);
-	if (ret < 0) {
-		ret = net_addr_pton(AF_INET6, server,
-				    &net_sin6(&ctx->tcp.remote)->sin6_addr);
-		if (ret < 0) {
-			/* Could be hostname, try DNS if configured. */
-#if !defined(CONFIG_DNS_RESOLVER)
-			NET_ERR("Invalid IPv4 or IPv6 address %s", server);
-			return -EINVAL;
-#else
-			ret = resolve_name(ctx, server, DNS_QUERY_TYPE_A);
-			if (ret < 0) {
-				ret = resolve_name(ctx, server,
-						   DNS_QUERY_TYPE_AAAA);
-				if (ret < 0) {
-					NET_ERR("Cannot resolve %s (%d)",
-						server, ret);
-					return ret;
-				}
-
-				goto ipv6;
+			ret = snprintk(content_len_str, HTTP_CONTENT_LEN_SIZE,
+				       "%zd", req->payload_len);
+			if (ret <= 0 || ret >= HTTP_CONTENT_LEN_SIZE) {
+				ret = -ENOMEM;
+				goto out;
 			}
 
-			goto ipv4;
-#endif /* !CONFIG_DNS_RESOLVER */
+			ret = http_send_data(sock, send_buf, send_buf_max_len,
+					     &send_buf_pos, "Content-Length", ": ",
+					     content_len_str, HTTP_CRLF,
+					     HTTP_CRLF, NULL);
 		} else {
-#if defined(CONFIG_DNS_RESOLVER)
-		ipv6:
-#endif
-			net_sin6(&ctx->tcp.remote)->sin6_port =
-				htons(server_port);
-			net_sin6(&ctx->tcp.remote)->sin6_family = AF_INET6;
+			ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, HTTP_CRLF, NULL);
+		}
+
+		if (ret < 0) {
+			goto out;
+		}
+
+		total_sent += ret;
+
+		ret = http_flush_data(sock, send_buf, send_buf_pos);
+		if (ret < 0) {
+			goto out;
+		}
+
+		send_buf_pos = 0;
+		total_sent += ret;
+
+		if (req->payload_cb) {
+			ret = req->payload_cb(sock, req, user_data);
+			if (ret < 0) {
+				goto out;
+			}
+
+			total_sent += ret;
+		} else {
+			uint32_t length;
+
+			if (req->payload_len == 0) {
+				length = strlen(req->payload);
+			} else {
+				length = req->payload_len;
+			}
+
+			ret = sendall(sock, req->payload, length);
+			if (ret < 0) {
+				goto out;
+			}
+
+			total_sent += length;
 		}
 	} else {
-#if defined(CONFIG_DNS_RESOLVER)
-	ipv4:
-#endif
-		net_sin(&ctx->tcp.remote)->sin_port = htons(server_port);
-		net_sin(&ctx->tcp.remote)->sin_family = AF_INET;
-	}
-#endif /* IPV4 && IPV6 */
-
-	/* If we have not yet figured out what is the protocol family,
-	 * then we cannot continue.
-	 */
-	if (ctx->tcp.remote.family == AF_UNSPEC) {
-		NET_ERR("Unknown protocol family.");
-		return -EPFNOSUPPORT;
-	}
-
-	return 0;
-}
-
-int http_client_init(struct http_client_ctx *ctx,
-		     const char *server, u16_t server_port)
-{
-	int ret;
-
-	memset(ctx, 0, sizeof(*ctx));
-
-	if (server) {
-		ret = set_remote_addr(ctx, server, server_port);
+		ret = http_send_data(sock, send_buf, send_buf_max_len,
+				     &send_buf_pos, HTTP_CRLF, NULL);
 		if (ret < 0) {
-			return ret;
+			goto out;
+		}
+	}
+
+	if (send_buf_pos > 0) {
+		ret = http_flush_data(sock, send_buf, send_buf_pos);
+		if (ret < 0) {
+			goto out;
 		}
 
-		ctx->tcp.local.family = ctx->tcp.remote.family;
-		ctx->server = server;
+		total_sent += ret;
 	}
 
-	ctx->settings.on_body = on_body;
-	ctx->settings.on_chunk_complete = on_chunk_complete;
-	ctx->settings.on_chunk_header = on_chunk_header;
-	ctx->settings.on_headers_complete = on_headers_complete;
-	ctx->settings.on_header_field = on_header_field;
-	ctx->settings.on_header_value = on_header_value;
-	ctx->settings.on_message_begin = on_message_begin;
-	ctx->settings.on_message_complete = on_message_complete;
-	ctx->settings.on_status = on_status;
-	ctx->settings.on_url = on_url;
+	NET_DBG("Sent %d bytes", total_sent);
 
-	ctx->tcp.receive_cb = http_receive_cb;
-	ctx->tcp.timeout = HTTP_NETWORK_TIMEOUT;
+	http_client_init_parser(&req->internal.parser,
+				&req->internal.parser_settings);
 
-	k_sem_init(&ctx->req.wait, 0, 1);
-
-	return 0;
-}
-
-void http_client_release(struct http_client_ctx *ctx)
-{
-	if (!ctx) {
-		return;
+	if (!K_TIMEOUT_EQ(req->internal.timeout, K_FOREVER) &&
+	    !K_TIMEOUT_EQ(req->internal.timeout, K_NO_WAIT)) {
+		k_work_init_delayable(&req->internal.work, http_timeout);
+		(void)k_work_reschedule(&req->internal.work,
+					req->internal.timeout);
 	}
 
-	net_context_put(ctx->tcp.ctx);
-	ctx->tcp.receive_cb = NULL;
-	ctx->rsp.cb = NULL;
-	k_sem_give(&ctx->req.wait);
-
-#if defined(CONFIG_DNS_RESOLVER)
-	if (ctx->dns_id) {
-		dns_cancel_addr_info(ctx->dns_id);
+	/* Request is sent, now wait data to be received */
+	total_recv = http_wait_data(sock, req);
+	if (total_recv < 0) {
+		NET_DBG("Wait data failure (%d)", total_recv);
+	} else {
+		NET_DBG("Received %d bytes", total_recv);
 	}
-#endif
 
-	/* Let all the pending waiters run */
-	k_yield();
+	if (!K_TIMEOUT_EQ(req->internal.timeout, K_FOREVER) &&
+	    !K_TIMEOUT_EQ(req->internal.timeout, K_NO_WAIT)) {
+		(void)k_work_cancel_delayable(&req->internal.work);
+	}
 
-	memset(ctx, 0, sizeof(*ctx));
+	return total_sent;
+
+out:
+	return ret;
 }

@@ -6,26 +6,24 @@ DNS Resolve Application
 Overview
 ********
 
-The DNS resolver sample application implements a basic DNS resolver according
-to RFC 1035. Supported DNS answers are IPv4/IPv6 addresses and CNAME.
+This application will setup IP address for the device, and then
+try to resolve various hostnames according to how the user has
+configured the system.
 
-If a CNAME is received, the DNS resolver will create another DNS query.
-The number of additional queries is controlled by the
-DNS_RESOLVER_ADDITIONAL_QUERIES Kconfig variable.
-
-For more information about DNS configuration variables, see:
-:file:`subsys/net/lib/dns/Kconfig`. The DNS resolver API can be found at
-:file:`include/net/dns_resolve.h`. The sample code can be found at:
-:file:`samples/net/dns_resolve`.
+- If IPv4 is enabled, then A record for ``www.zephyrproject.org`` is
+  resolved.
+- If IPv6 is enabled, then AAAA record for ``www.zephyrproject.org`` is
+  resolved.
+- If mDNS is enabled, then ``zephyr.local`` name is resolved.
 
 Requirements
 ************
 
-- :ref:`networking with Qemu <networking_with_qemu>`
+- :ref:`networking_with_host`
 
 - screen terminal emulator or equivalent.
 
-- For the Arduino 101 board, the ENC28J60 Ethernet module is required.
+- For most boards without ethernet, the ENC28J60 Ethernet module is required.
 
 - dnsmasq application. The dnsmasq version used in this sample is:
 
@@ -33,27 +31,6 @@ Requirements
 
     dnsmasq -v
     Dnsmasq version 2.76  Copyright (c) 2000-2016 Simon Kelley
-
-
-Wiring
-******
-
-The ENC28J60 module is an Ethernet device with SPI interface.
-The following pins must be connected from the ENC28J60 device to the
-Arduino 101 board:
-
-===========	===================================
-Arduino 101	ENC28J60 (pin numbers on the board)
-===========	===================================
-D13		SCK  (1)
-D12		SO   (3)
-D11		SI   (2)
-D10		CS   (7)
-D04		INT  (5)
-3.3V		VCC  (10)
-GDN		GND  (9)
-===========	===================================
-
 
 Building and Running
 ********************
@@ -71,9 +48,8 @@ for example:
 
 .. code-block:: console
 
-	CONFIG_NET_APP_MY_IPV6_ADDR="2001:db8::1"
-	CONFIG_NET_APP_PEER_IPV6_ADDR="2001:db8::2"
-
+	CONFIG_NET_CONFIG_MY_IPV6_ADDR="2001:db8::1"
+	CONFIG_NET_CONFIG_PEER_IPV6_ADDR="2001:db8::2"
 
 are the IPv6 addresses for the DNS client running Zephyr and the DNS server,
 respectively.
@@ -82,22 +58,31 @@ DNS server
 ==========
 
 The dnsmasq tool may be used for testing purposes. Sample dnsmasq start
-script can be found in net-tools project.
-
-The net-tools can be downloaded from
-
-    https://github.com/zephyrproject-rtos/net-tools
-
+script can be downloaded from the zephyrproject-rtos/net-tools project area:
+https://github.com/zephyrproject-rtos/net-tools
 
 Open a terminal window and type:
 
 .. code-block:: console
 
     $ cd net-tools
-    $ ./dnsmasq.sh
+    $ sudo ./dnsmasq.sh
 
+The default project configurations settings for this sample uses the public
+Google DNS servers.  In order to use the local dnsmasq server, please edit
+the appropriate 'prj.conf' file and update the DNS server addresses.  For
+instance, if using the usual IP addresses assigned to testing, update them
+to the following values:
 
-NOTE: some systems may require root privileges to run dnsmaq, use sudo or su.
+.. code-block:: console
+
+    CONFIG_DNS_SERVER1="192.0.2.2:5353"
+    CONFIG_DNS_SERVER2="[2001:db8::2]:5353"
+
+.. note::
+    DNS uses port 53 by default, but the dnsmasq.conf file provided by
+    net-tools uses port 5353 to allow executing the daemon without
+    superuser privileges.
 
 If dnsmasq fails to start with an error like this:
 
@@ -105,38 +90,43 @@ If dnsmasq fails to start with an error like this:
 
     dnsmasq: failed to create listening socket for port 5353: Address already in use
 
-
 Open a terminal window and type:
 
 .. code-block:: console
 
     $ killall -s KILL dnsmasq
 
-
 Try to launch the dnsmasq application again.
+
+For testing mDNS, use Avahi script in net-tools project:
+
+.. code-block:: console
+
+    $ cd net-tools
+    $ ./avahi-daemon.sh
+
+
+LLMNR Responder
+===============
+
+If you want Zephyr to respond to a LLMNR DNS request that Windows host is
+sending, then following config options could be set:
+
+.. code-block:: console
+
+    CONFIG_NET_HOSTNAME_ENABLE=y
+    CONFIG_NET_HOSTNAME="zephyr-device"
+    CONFIG_DNS_RESOLVER=y
+    CONFIG_LLMNR_RESPONDER=y
+
+A Zephyr host needs a hostname assigned to it so that it can respond to a DNS
+query. Note that the hostname should not have any dots in it.
 
 
 QEMU x86
 ========
 
-Open a terminal window and type:
-
-.. code-block:: console
-
-    $ make
-
-
-Run 'loop_socat.sh' and 'loop-slip-tap.sh' as shown in the net-tools README
-at:
-
-    https://github.com/zephyrproject-rtos/net-tools
-
-
-Open a terminal where the project was build (i.e. :file:`samples/net/dns_resolve`) and type:
-
-.. code-block:: console
-
-    $ make run
+To use QEMU for testing, follow the :ref:`networking_with_qemu` guide.
 
 
 FRDM K64F
@@ -144,18 +134,11 @@ FRDM K64F
 
 Open a terminal window and type:
 
-.. code-block:: console
-
-    $ make BOARD=frdm_k64f
-
-
-The FRDM K64F board is detected as a USB storage device. The board
-must be mounted (i.e. to /mnt) to 'flash' the binary:
-
-.. code-block:: console
-
-    $ cp outdir/frdm_k64f/zephyr.bin /mnt
-
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/dns_resolve
+   :board: frdm_k64f
+   :goals: build flash
+   :compact:
 
 See :ref:`Freedom-K64F board documentation <frdm_k64f>` for more information
 about this board.
@@ -170,27 +153,3 @@ Open a terminal window and type:
 Use 'dmesg' to find the right USB device.
 
 Once the binary is loaded into the FRDM board, press the RESET button.
-
-Arduino 101
-===========
-
-Open a terminal window and type:
-
-.. code-block:: console
-
-	$ make BOARD=arduino_101
-
-
-To load the binary in the development board follow the steps
-in :ref:`arduino_101`.
-
-Open a terminal window and type:
-
-.. code-block:: console
-
-    $ screen /dev/ttyUSB0 115200
-
-
-Use 'dmesg' to find the right USB device.
-
-Once the binary is loaded into the Arduino 101 board, press the RESET button.

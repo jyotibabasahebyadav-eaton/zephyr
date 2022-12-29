@@ -32,7 +32,7 @@
  * @}
  */
 
-#include <test_uart.h>
+#include "test_uart.h"
 
 static volatile bool data_transmitted;
 static volatile bool data_received;
@@ -41,10 +41,12 @@ static const char fifo_data[] = "This is a FIFO test.\r\n";
 
 #define DATA_SIZE	(sizeof(fifo_data) - 1)
 
-static void uart_fifo_callback(struct device *dev)
+static void uart_fifo_callback(const struct device *dev, void *user_data)
 {
-	u8_t recvData;
+	uint8_t recvData;
 	static int tx_data_idx;
+
+	ARG_UNUSED(user_data);
 
 	/* Verify uart_irq_update() */
 	if (!uart_irq_update(dev)) {
@@ -63,7 +65,7 @@ static void uart_fifo_callback(struct device *dev)
 		 * well, we'll fail test.
 		 */
 		if (uart_fifo_fill(dev,
-				   (u8_t *)&fifo_data[tx_data_idx++], 1) > 0) {
+				   (uint8_t *)&fifo_data[tx_data_idx++], 1) > 0) {
 			data_transmitted = true;
 			char_sent++;
 		}
@@ -90,7 +92,12 @@ static void uart_fifo_callback(struct device *dev)
 
 static int test_fifo_read(void)
 {
-	struct device *uart_dev = device_get_binding(UART_DEVICE_NAME);
+	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+	if (!device_is_ready(uart_dev)) {
+		TC_PRINT("UART device not ready\n");
+		return TC_FAIL;
+	}
 
 	/* Verify uart_irq_callback_set() */
 	uart_irq_callback_set(uart_dev, uart_fifo_callback);
@@ -102,8 +109,11 @@ static int test_fifo_read(void)
 	TC_PRINT("Please send characters to serial console\n");
 
 	data_received = false;
-	while (data_received == false)
-		;
+	while (data_received == false) {
+		/* Allow other thread/workqueue to work. */
+		k_yield();
+	}
+
 	/* Verify uart_irq_rx_disable() */
 	uart_irq_rx_disable(uart_dev);
 
@@ -112,7 +122,12 @@ static int test_fifo_read(void)
 
 static int test_fifo_fill(void)
 {
-	struct device *uart_dev = device_get_binding(UART_DEVICE_NAME);
+	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+	if (!device_is_ready(uart_dev)) {
+		TC_PRINT("UART device not ready\n");
+		return TC_FAIL;
+	}
 
 	char_sent = 0;
 
@@ -123,7 +138,7 @@ static int test_fifo_fill(void)
 	/* Verify uart_irq_tx_enable() */
 	uart_irq_tx_enable(uart_dev);
 
-	k_sleep(500);
+	k_sleep(K_MSEC(500));
 
 	/* Verify uart_irq_tx_disable() */
 	uart_irq_tx_disable(uart_dev);

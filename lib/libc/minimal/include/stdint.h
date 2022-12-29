@@ -6,52 +6,176 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef __INC_stdint_h__
-#define __INC_stdint_h__
+#ifndef ZEPHYR_LIB_LIBC_MINIMAL_INCLUDE_STDINT_H_
+#define ZEPHYR_LIB_LIBC_MINIMAL_INCLUDE_STDINT_H_
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define INT8_MAX    0x7F
-#define INT16_MAX   0x7FFF
-#define INT32_MAX   0x7FFFFFFF
-#define INT64_MAX   0x7FFFFFFFFFFFFFFFll
+#define INT8_MAX    __INT8_MAX__
+#define INT16_MAX   __INT16_MAX__
+#define INT32_MAX   __INT32_MAX__
+#define INT64_MAX   __INT64_MAX__
+#define INTMAX_MAX  __INT64_MAX__
 
 #define INT8_MIN    (-INT8_MAX - 1)
 #define INT16_MIN   (-INT16_MAX - 1)
 #define INT32_MIN   (-INT32_MAX - 1)
-#define INT64_MIN   (-INT64_MAX - 1ll)
+#define INT64_MIN   (-INT64_MAX - 1LL)
 
-#define UINT8_MAX   0xFF
-#define UINT16_MAX  0xFFFF
-#define UINT32_MAX  0xFFFFFFFFu
-#define UINT64_MAX  0xFFFFFFFFFFFFFFFFull
+#define UINT8_MAX   __UINT8_MAX__
+#define UINT16_MAX  __UINT16_MAX__
+#define UINT32_MAX  __UINT32_MAX__
+#define UINT64_MAX  __UINT64_MAX__
+#define UINTMAX_MAX __UINT64_MAX__
 
-#define INTPTR_MIN  INT32_MIN
-#define INTPTR_MAX  INT32_MAX
-#define UINTPTR_MAX UINT32_MAX
+#define INTPTR_MAX  __INTPTR_MAX__
+#define INTPTR_MIN  (-INTPTR_MAX - 1)
+#define UINTPTR_MAX __UINTPTR_MAX__
 
-#define PTRDIFF_MIN INT32_MIN
-#define PTRDIFF_MAX INT32_MAX
+#define PTRDIFF_MAX __PTRDIFF_MAX__
+#define PTRDIFF_MIN (-PTRDIFF_MAX - 1)
 
-#define SIZE_MAX    UINT32_MAX
+#define SIZE_MAX    __SIZE_MAX__
 
-typedef signed char         int8_t;
-typedef signed short        int16_t;
-typedef signed int          int32_t;
-typedef signed long long    int64_t;
+typedef __INT8_TYPE__		int8_t;
+typedef __INT16_TYPE__		int16_t;
+typedef __INT32_TYPE__		int32_t;
+typedef __INT64_TYPE__		int64_t;
+typedef __INT64_TYPE__		intmax_t;
 
-typedef unsigned char       uint8_t;
-typedef unsigned short      uint16_t;
-typedef unsigned int        uint32_t;
-typedef unsigned long long  uint64_t;
+typedef __INT_FAST8_TYPE__	int_fast8_t;
+typedef __INT_FAST16_TYPE__	int_fast16_t;
+typedef __INT_FAST32_TYPE__	int_fast32_t;
+typedef __INT_FAST64_TYPE__	int_fast64_t;
 
-typedef int                 intptr_t;
-typedef unsigned int        uintptr_t;
+typedef __INT_LEAST8_TYPE__	int_least8_t;
+typedef __INT_LEAST16_TYPE__	int_least16_t;
+typedef __INT_LEAST32_TYPE__	int_least32_t;
+typedef __INT_LEAST64_TYPE__	int_least64_t;
+
+typedef __UINT8_TYPE__		uint8_t;
+typedef __UINT16_TYPE__		uint16_t;
+typedef __UINT32_TYPE__		uint32_t;
+typedef __UINT64_TYPE__		uint64_t;
+typedef __UINT64_TYPE__		uintmax_t;
+
+typedef __UINT_FAST8_TYPE__	uint_fast8_t;
+typedef __UINT_FAST16_TYPE__	uint_fast16_t;
+typedef __UINT_FAST32_TYPE__	uint_fast32_t;
+typedef __UINT_FAST64_TYPE__	uint_fast64_t;
+
+typedef __UINT_LEAST8_TYPE__	uint_least8_t;
+typedef __UINT_LEAST16_TYPE__	uint_least16_t;
+typedef __UINT_LEAST32_TYPE__	uint_least32_t;
+typedef __UINT_LEAST64_TYPE__	uint_least64_t;
+
+typedef __INTPTR_TYPE__		intptr_t;
+typedef __UINTPTR_TYPE__	uintptr_t;
+
+#ifdef __GNUC__
+/* These macros must produce constant integer expressions, which can't
+ * be done in the preprocessor (casts aren't allowed).  Defer to the
+ * GCC internal functions where they're available.
+ */
+#define INT8_C(_v) __INT8_C(_v)
+#define INT16_C(_v) __INT16_C(_v)
+#define INT32_C(_v) __INT32_C(_v)
+#define INT64_C(_v) __INT64_C(_v)
+#define INTMAX_C(_v) __INTMAX_C(_v)
+
+#define UINT8_C(_v) __UINT8_C(_v)
+#define UINT16_C(_v) __UINT16_C(_v)
+#define UINT32_C(_v) __UINT32_C(_v)
+#define UINT64_C(_v) __UINT64_C(_v)
+#define UINTMAX_C(_v) __UINTMAX_C(_v)
+#endif /* __GNUC__ */
+
+#ifdef __CCAC__
+#ifndef __INT8_C
+#define __INT8_C(x)	x
+#endif
+
+#ifndef INT8_C
+#define INT8_C(x)	__INT8_C(x)
+#endif
+
+#ifndef __UINT8_C
+#define __UINT8_C(x)	x ## U
+#endif
+
+#ifndef UINT8_C
+#define UINT8_C(x)	__UINT8_C(x)
+#endif
+
+#ifndef __INT16_C
+#define __INT16_C(x)	x
+#endif
+
+#ifndef INT16_C
+#define INT16_C(x)	__INT16_C(x)
+#endif
+
+#ifndef __UINT16_C
+#define __UINT16_C(x)	x ## U
+#endif
+
+#ifndef UINT16_C
+#define UINT16_C(x)	__UINT16_C(x)
+#endif
+
+#ifndef __INT32_C
+#define __INT32_C(x)	x
+#endif
+
+#ifndef INT32_C
+#define INT32_C(x)	__INT32_C(x)
+#endif
+
+#ifndef __UINT32_C
+#define __UINT32_C(x)	x ## U
+#endif
+
+#ifndef UINT32_C
+#define UINT32_C(x)	__UINT32_C(x)
+#endif
+
+#ifndef __INT64_C
+#define __INT64_C(x)	x
+#endif
+
+#ifndef INT64_C
+#define INT64_C(x)	__INT64_C(x)
+#endif
+
+#ifndef __UINT64_C
+#define __UINT64_C(x)	x ## ULL
+#endif
+
+#ifndef UINT64_C
+#define UINT64_C(x)	__UINT64_C(x)
+#endif
+
+#ifndef __INTMAX_C
+#define __INTMAX_C(x)	x
+#endif
+
+#ifndef INTMAX_C
+#define INTMAX_C(x)	__INTMAX_C(x)
+#endif
+
+#ifndef __UINTMAX_C
+#define __UINTMAX_C(x)	x ## ULL
+#endif
+
+#ifndef UINTMAX_C
+#define UINTMAX_C(x)	__UINTMAX_C(x)
+#endif
+#endif /* __CCAC__ */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __INC_stdint_h__ */
+#endif /* ZEPHYR_LIB_LIBC_MINIMAL_INCLUDE_STDINT_H_ */

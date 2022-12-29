@@ -5,169 +5,108 @@
  */
 
 #include <kernel.h>
-#include <kernel_structs.h>
 #include <toolchain.h>
-#include <sections.h>
-#include <drivers/system_timer.h>
+#include <linker/sections.h>
+#include <drivers/timer/system_timer.h>
 #include <wait_q.h>
-#include <power.h>
+#include <pm/pm.h>
+#include <stdbool.h>
+#include <logging/log.h>
+#include <ksched.h>
+#include <kswap.h>
 
-#if defined(CONFIG_TICKLESS_IDLE)
-/*
- * Idle time must be this value or higher for timer to go into tickless idle
- * state.
- */
-s32_t _sys_idle_threshold_ticks = CONFIG_TICKLESS_IDLE_THRESH;
+LOG_MODULE_DECLARE(os, CONFIG_KERNEL_LOG_LEVEL);
 
-#if defined(CONFIG_TICKLESS_KERNEL)
-#define _must_enter_tickless_idle(ticks) (1)
-#else
-#define _must_enter_tickless_idle(ticks) \
-		((ticks == K_FOREVER) || (ticks >= _sys_idle_threshold_ticks))
-#endif
-#else
-#define _must_enter_tickless_idle(ticks) ((void)ticks, (0))
-#endif /* CONFIG_TICKLESS_IDLE */
-
-#ifdef CONFIG_SYS_POWER_MANAGEMENT
-/*
- * Used to allow _sys_soc_suspend() implementation to control notification
- * of the event that caused exit from kernel idling after pm operations.
- */
-unsigned char _sys_pm_idle_exit_notify;
-
-void __attribute__((weak)) _sys_soc_resume(void)
+void z_pm_save_idle_exit(void)
 {
-}
-
-void __attribute__((weak)) _sys_soc_resume_from_deep_sleep(void)
-{
-}
-
-/**
- *
- * @brief Indicate that kernel is idling in tickless mode
- *
- * Sets the kernel data structure idle field to either a positive value or
- * K_FOREVER.
- *
- * @param ticks the number of ticks to idle
- *
- * @return N/A
- */
-static void set_kernel_idle_time_in_ticks(s32_t ticks)
-{
-	_kernel.idle = ticks;
-}
-#else
-#define set_kernel_idle_time_in_ticks(x) do { } while (0)
-#endif
-
-static void _sys_power_save_idle(s32_t ticks)
-{
-#ifdef CONFIG_TICKLESS_KERNEL
-	if (ticks != K_FOREVER) {
-		ticks -= _get_elapsed_program_time();
-		if (!ticks) {
-			/*
-			 * Timer has expired or about to expire
-			 * No time for power saving operations
-			 *
-			 * Note that it will never be zero unless some time
-			 * had elapsed since timer was last programmed.
-			 */
-			k_cpu_idle();
-			return;
-		}
-	}
-#endif
-	if (_must_enter_tickless_idle(ticks)) {
-		/*
-		 * Stop generating system timer interrupts until it's time for
-		 * the next scheduled kernel timer to expire.
-		 */
-
-		/*
-		 * In the case of tickless kernel, timer driver should
-		 * reprogram timer only if the currently programmed time
-		 * duration is smaller than the idle time.
-		 */
-		_timer_idle_enter(ticks);
-	}
-
-	set_kernel_idle_time_in_ticks(ticks);
-#if (defined(CONFIG_SYS_POWER_LOW_POWER_STATE) || \
-	defined(CONFIG_SYS_POWER_DEEP_SLEEP))
-
-	_sys_pm_idle_exit_notify = 1;
-
-	/*
-	 * Call the suspend hook function of the soc interface to allow
-	 * entry into a low power state. The function returns
-	 * SYS_PM_NOT_HANDLED if low power state was not entered, in which
-	 * case, kernel does normal idle processing.
-	 *
-	 * This function is entered with interrupts disabled. If a low power
-	 * state was entered, then the hook function should enable inerrupts
-	 * before exiting. This is because the kernel does not do its own idle
-	 * processing in those cases i.e. skips k_cpu_idle(). The kernel's
-	 * idle processing re-enables interrupts which is essential for
-	 * the kernel's scheduling logic.
-	 */
-	if (_sys_soc_suspend(ticks) == SYS_PM_NOT_HANDLED) {
-		_sys_pm_idle_exit_notify = 0;
-		k_cpu_idle();
-	}
-#else
-	k_cpu_idle();
-#endif
-}
-
-void _sys_power_save_idle_exit(s32_t ticks)
-{
-#if defined(CONFIG_SYS_POWER_LOW_POWER_STATE)
+#ifdef CONFIG_PM
 	/* Some CPU low power states require notification at the ISR
 	 * to allow any operations that needs to be done before kernel
-	 * switches task or processes nested interrupts. This can be
-	 * disabled by calling _sys_soc_pm_idle_exit_notification_disable().
-	 * Alternatively it can be simply ignored if not required.
+	 * switches task or processes nested interrupts.
+	 * This can be simply ignored if not required.
 	 */
-	if (_sys_pm_idle_exit_notify) {
-		_sys_soc_resume();
-	}
-#endif
-
-	if (_must_enter_tickless_idle(ticks)) {
-		/* Resume normal periodic system timer interrupts */
-		_timer_idle_exit();
-	}
+	pm_system_resume();
+#endif	/* CONFIG_PM */
+	sys_clock_idle_exit();
 }
-
-
-#if K_IDLE_PRIO < 0
-#define IDLE_YIELD_IF_COOP() k_yield()
-#else
-#define IDLE_YIELD_IF_COOP() do { } while ((0))
-#endif
-
+uint32_t debug_idle[11]={0};
 void idle(void *unused1, void *unused2, void *unused3)
 {
 	ARG_UNUSED(unused1);
 	ARG_UNUSED(unused2);
 	ARG_UNUSED(unused3);
 
-#ifdef CONFIG_BOOT_TIME_MEASUREMENT
-	/* record timestamp when idling begins */
-
-	extern u64_t __idle_tsc;
-
-	__idle_tsc = _tsc_read();
+	__ASSERT_NO_MSG(_current->base.prio >= 0);
+debug_idle[0]++;
+	while (true) {
+debug_idle[1]++;
+		/* SMP systems without a working IPI can't
+		 * actual enter an idle state, because they
+		 * can't be notified of scheduler changes
+		 * (i.e. threads they should run).  They just
+		 * spin in a yield loop.  This is intended as
+		 * a fallback configuration for new platform
+		 * bringup.
+		 */
+debug_idle[2]++;
+		if (IS_ENABLED(CONFIG_SMP) &&
+		    !IS_ENABLED(CONFIG_SCHED_IPI_SUPPORTED)) {
+			k_busy_wait(100);
+			k_yield();
+debug_idle[3]++;
+			continue;
+		}
+debug_idle[4]++;
+		/* Note weird API: k_cpu_idle() is called with local
+		 * CPU interrupts masked, and returns with them
+		 * unmasked.  It does not take a spinlock or other
+		 * higher level construct.
+		 */
+debug_idle[5]++;
+		(void) arch_irq_lock();
+debug_idle[6]++;
+#ifdef CONFIG_PM
+		_kernel.idle = z_get_next_timeout_expiry();
+debug_idle[7]++;
+		/*
+		 * Call the suspend hook function of the soc interface
+		 * to allow entry into a low power state. The function
+		 * returns false if low power state was not entered, in
+		 * which case, kernel does normal idle processing.
+		 *
+		 * This function is entered with interrupts disabled.
+		 * If a low power state was entered, then the hook
+		 * function should enable inerrupts before exiting.
+		 * This is because the kernel does not do its own idle
+		 * processing in those cases i.e. skips k_cpu_idle().
+		 * The kernel's idle processing re-enables interrupts
+		 * which is essential for the kernel's scheduling
+		 * logic.
+		 */
+debug_idle[8]++;
+		if (pm_system_suspend(_kernel.idle) == false) {
+			k_cpu_idle();
+		}
+#else
+		k_cpu_idle();
 #endif
-
-	for (;;) {
-		(void)irq_lock();
-		_sys_power_save_idle(_get_next_timeout_expiry());
-
-		IDLE_YIELD_IF_COOP();
+debug_idle[9]++;
+#if !defined(CONFIG_PREEMPT_ENABLED)
+# if !defined(CONFIG_USE_SWITCH) || defined(CONFIG_SPARC)
+		/* A legacy mess: the idle thread is by definition
+		 * preemptible as far as the modern scheduler is
+		 * concerned, but older platforms use
+		 * CONFIG_PREEMPT_ENABLED=n as an optimization hint
+		 * that interrupt exit always returns to the
+		 * interrupted context.  So in that setup we need to
+		 * explicitly yield in the idle thread otherwise
+		 * nothing else will run once it starts.
+		 */
+		if (_kernel.ready_q.cache != _current) {
+			z_swap_unlocked();
+		}
+# endif
+#endif
+debug_idle[10]++;
 	}
 }

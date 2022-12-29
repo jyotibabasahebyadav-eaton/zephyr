@@ -1,90 +1,113 @@
 /*
- * Copyright (c) 2016 Wind River Systems, Inc.
- *
+ * Copyright (c) 2019 Intel Corporation
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* this file is only meant to be included by kernel_structs.h */
+#ifndef ZEPHYR_ARCH_X86_INCLUDE_KERNEL_ARCH_FUNC_H_
+#define ZEPHYR_ARCH_X86_INCLUDE_KERNEL_ARCH_FUNC_H_
 
-#ifndef _kernel_arch_func__h_
-#define _kernel_arch_func__h_
+#include <kernel_arch_data.h>
+#include <arch/x86/mmustructs.h>
+
+#ifdef CONFIG_X86_64
+#include <intel64/kernel_arch_func.h>
+#else
+#include <ia32/kernel_arch_func.h>
+#endif
 
 #ifndef _ASMLANGUAGE
+static inline bool arch_is_in_isr(void)
+{
+#ifdef CONFIG_SMP
+	/* On SMP, there is a race vs. the current CPU changing if we
+	 * are preempted.  Need to mask interrupts while inspecting
+	 * (note deliberate lack of gcc size suffix on the
+	 * instructions, we need to work with both architectures here)
+	 */
+	bool ret;
 
-#ifdef __cplusplus
-extern "C" {
+	__asm__ volatile ("pushf; cli");
+	ret = arch_curr_cpu()->nested != 0;
+	__asm__ volatile ("popf");
+	return ret;
+#else
+	return _kernel.cpus[0].nested != 0U;
 #endif
-
-/* stack alignment related macros: STACK_ALIGN_SIZE is defined above */
-
-#define STACK_ROUND_UP(x) ROUND_UP(x, STACK_ALIGN_SIZE)
-#define STACK_ROUND_DOWN(x) ROUND_DOWN(x, STACK_ALIGN_SIZE)
-
-/**
- *
- * @brief Performs architecture-specific initialization
- *
- * This routine performs architecture-specific initialization of the kernel.
- * Trivial stuff is done inline; more complex initialization is done via
- * function calls.
- *
- * @return N/A
- */
-static inline void kernel_arch_init(void)
-{
-	extern char _interrupt_stack[CONFIG_ISR_STACK_SIZE];
-
-	_kernel.nested = 0;
-	_kernel.irq_stack = _interrupt_stack + CONFIG_ISR_STACK_SIZE;
 }
 
-/**
- *
- * @brief Set the return value for the specified fiber (inline)
- *
- * @param fiber pointer to fiber
- * @param value value to set as return value
- *
- * The register used to store the return value from a function call invocation
- * is set to <value>.  It is assumed that the specified <fiber> is pending, and
- * thus the fibers context is stored in its TCS.
- *
- * @return N/A
+struct multiboot_info;
+
+extern FUNC_NORETURN void z_x86_prep_c(void *arg);
+
+#ifdef CONFIG_X86_VERY_EARLY_CONSOLE
+/* Setup ultra-minimal serial driver for printk() */
+void z_x86_early_serial_init(void);
+#endif /* CONFIG_X86_VERY_EARLY_CONSOLE */
+
+
+/* Called upon CPU exception that is unhandled and hence fatal; dump
+ * interesting info and call z_x86_fatal_error()
  */
-static ALWAYS_INLINE void
-_set_thread_return_value(struct k_thread *thread, unsigned int value)
-{
-	/* write into 'eax' slot created in _Swap() entry */
+FUNC_NORETURN void z_x86_unhandled_cpu_exception(uintptr_t vector,
+						 const z_arch_esf_t *esf);
 
-	*(unsigned int *)(thread->callee_saved.esp) = value;
-}
+/* Called upon unrecoverable error; dump registers and transfer control to
+ * kernel via z_fatal_error()
+ */
+FUNC_NORETURN void z_x86_fatal_error(unsigned int reason,
+				     const z_arch_esf_t *esf);
 
-extern void k_cpu_atomic_idle(unsigned int imask);
+/* Common handling for page fault exceptions */
+void z_x86_page_fault_handler(z_arch_esf_t *esf);
 
-extern void _MsrWrite(unsigned int msr, u64_t msrData);
-extern u64_t _MsrRead(unsigned int msr);
+#ifdef CONFIG_THREAD_STACK_INFO
+/**
+ * @brief Check if a memory address range falls within the stack
+ *
+ * Given a memory address range, ensure that it falls within the bounds
+ * of the faulting context's stack.
+ *
+ * @param addr Starting address
+ * @param size Size of the region, or 0 if we just want to see if addr is
+ *             in bounds
+ * @param cs Code segment of faulting context
+ * @return true if addr/size region is not within the thread stack
+ */
+bool z_x86_check_stack_bounds(uintptr_t addr, size_t size, uint16_t cs);
+#endif /* CONFIG_THREAD_STACK_INFO */
+
+#ifdef CONFIG_USERSPACE
+extern FUNC_NORETURN void z_x86_userspace_enter(k_thread_entry_t user_entry,
+					       void *p1, void *p2, void *p3,
+					       uintptr_t stack_end,
+					       uintptr_t stack_start);
+
+/* Preparation steps needed for all threads if user mode is turned on.
+ *
+ * Returns the initial entry point to swap into.
+ */
+void *z_x86_userspace_prepare_thread(struct k_thread *thread);
+
+#endif /* CONFIG_USERSPACE */
+
+void z_x86_do_kernel_oops(const z_arch_esf_t *esf);
 
 /*
- * _IntLibInit() is called from the non-arch specific function,
- * prepare_multithreading(). The IA-32 kernel does not require any special
- * initialization of the interrupt subsystem. However, we still need to
- * provide an _IntLibInit() of some sort to prevent build errors.
+ * Find a free IRQ vector at the specified priority, or return -1 if none left.
+ * For multiple vector allocated one after another, prev_vector can be used to
+ * speed up the allocation: it only needs to be filled with the previous
+ * allocated vector, or -1 to start over.
  */
-static inline void _IntLibInit(void)
-{
-}
+int z_x86_allocate_vector(unsigned int priority, int prev_vector);
 
-/* the _idt_base_address symbol is generated via a linker script */
-extern unsigned char _idt_base_address[];
+/*
+ * Connect a vector
+ */
+void z_x86_irq_connect_on_vector(unsigned int irq,
+				 uint8_t vector,
+				 void (*func)(const void *arg),
+				 const void *arg);
 
-#include <stddef.h> /* For size_t */
+#endif /* !_ASMLANGUAGE */
 
-#ifdef __cplusplus
-}
-#endif
-
-#define _is_in_isr() (_kernel.nested != 0)
-
-#endif /* _ASMLANGUAGE */
-
-#endif /* _kernel_arch_func__h_ */
+#endif /* ZEPHYR_ARCH_X86_INCLUDE_KERNEL_ARCH_FUNC_H_ */

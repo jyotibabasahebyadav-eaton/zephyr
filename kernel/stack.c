@@ -10,103 +10,178 @@
 
 #include <kernel.h>
 #include <kernel_structs.h>
-#include <debug/object_tracing_common.h>
+
 #include <toolchain.h>
-#include <sections.h>
 #include <ksched.h>
 #include <wait_q.h>
-#include <misc/__assert.h>
+#include <sys/check.h>
 #include <init.h>
+#include <syscall_handler.h>
+#include <kernel_internal.h>
 
-extern struct k_stack _k_stack_list_start[];
-extern struct k_stack _k_stack_list_end[];
-
-#ifdef CONFIG_OBJECT_TRACING
-
-struct k_stack *_trace_list_k_stack;
-
-/*
- * Complete initialization of statically defined stacks.
- */
-static int init_stack_module(struct device *dev)
+void k_stack_init(struct k_stack *stack, stack_data_t *buffer,
+		  uint32_t num_entries)
 {
-	ARG_UNUSED(dev);
-
-	struct k_stack *stack;
-
-	for (stack = _k_stack_list_start; stack < _k_stack_list_end; stack++) {
-		SYS_TRACING_OBJ_INIT(k_stack, stack);
-	}
-	return 0;
-}
-
-SYS_INIT(init_stack_module, PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_OBJECTS);
-
-#endif /* CONFIG_OBJECT_TRACING */
-
-void k_stack_init(struct k_stack *stack, u32_t *buffer, int num_entries)
-{
-	sys_dlist_init(&stack->wait_q);
+	z_waitq_init(&stack->wait_q);
+	stack->lock = (struct k_spinlock) {};
 	stack->next = stack->base = buffer;
 	stack->top = stack->base + num_entries;
 
-	SYS_TRACING_OBJ_INIT(k_stack, stack);
+	SYS_PORT_TRACING_OBJ_INIT(k_stack, stack);
+	z_object_init(stack);
 }
 
-void k_stack_push(struct k_stack *stack, u32_t data)
+int32_t z_impl_k_stack_alloc_init(struct k_stack *stack, uint32_t num_entries)
+{
+	void *buffer;
+	int32_t ret;
+
+	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_stack, alloc_init, stack);
+
+	buffer = z_thread_malloc(num_entries * sizeof(stack_data_t));
+	if (buffer != NULL) {
+		k_stack_init(stack, buffer, num_entries);
+		stack->flags = K_STACK_FLAG_ALLOC;
+		ret = (int32_t)0;
+	} else {
+		ret = -ENOMEM;
+	}
+
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, alloc_init, stack, ret);
+
+	return ret;
+}
+
+#ifdef CONFIG_USERSPACE
+static inline int32_t z_vrfy_k_stack_alloc_init(struct k_stack *stack,
+					      uint32_t num_entries)
+{
+	Z_OOPS(Z_SYSCALL_OBJ_NEVER_INIT(stack, K_OBJ_STACK));
+	Z_OOPS(Z_SYSCALL_VERIFY(num_entries > 0));
+	return z_impl_k_stack_alloc_init(stack, num_entries);
+}
+#include <syscalls/k_stack_alloc_init_mrsh.c>
+#endif
+
+int k_stack_cleanup(struct k_stack *stack)
+{
+	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_stack, cleanup, stack);
+
+	CHECKIF(z_waitq_head(&stack->wait_q) != NULL) {
+		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, cleanup, stack, -EAGAIN);
+
+		return -EAGAIN;
+	}
+
+	if ((stack->flags & K_STACK_FLAG_ALLOC) != (uint8_t)0) {
+		k_free(stack->base);
+		stack->base = NULL;
+		stack->flags &= ~K_STACK_FLAG_ALLOC;
+	}
+
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, cleanup, stack, 0);
+
+	return 0;
+}
+
+int z_impl_k_stack_push(struct k_stack *stack, stack_data_t data)
 {
 	struct k_thread *first_pending_thread;
-	unsigned int key;
+	int ret = 0;
+	k_spinlock_key_t key = k_spin_lock(&stack->lock);
 
-	__ASSERT(stack->next != stack->top, "stack is full");
+	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_stack, push, stack);
 
-	key = irq_lock();
+	CHECKIF(stack->next == stack->top) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
-	first_pending_thread = _unpend_first_thread(&stack->wait_q);
+	first_pending_thread = z_unpend_first_thread(&stack->wait_q);
 
-	if (first_pending_thread) {
-		_abort_thread_timeout(first_pending_thread);
-		_ready_thread(first_pending_thread);
-
-		_set_thread_return_value_with_data(first_pending_thread,
+	if (first_pending_thread != NULL) {
+		z_thread_return_value_set_with_data(first_pending_thread,
 						   0, (void *)data);
 
-		if (!_is_in_isr() && _must_switch_threads()) {
-			(void)_Swap(key);
-			return;
-		}
+		z_ready_thread(first_pending_thread);
+		z_reschedule(&stack->lock, key);
+		goto end;
 	} else {
 		*(stack->next) = data;
 		stack->next++;
+		goto out;
 	}
 
-	irq_unlock(key);
+out:
+	k_spin_unlock(&stack->lock, key);
+
+end:
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, push, stack, ret);
+
+	return ret;
 }
 
-int k_stack_pop(struct k_stack *stack, u32_t *data, s32_t timeout)
+#ifdef CONFIG_USERSPACE
+static inline int z_vrfy_k_stack_push(struct k_stack *stack, stack_data_t data)
 {
-	unsigned int key;
+	Z_OOPS(Z_SYSCALL_OBJ(stack, K_OBJ_STACK));
+
+	return z_impl_k_stack_push(stack, data);
+}
+#include <syscalls/k_stack_push_mrsh.c>
+#endif
+
+int z_impl_k_stack_pop(struct k_stack *stack, stack_data_t *data,
+		       k_timeout_t timeout)
+{
+	k_spinlock_key_t key;
 	int result;
 
-	key = irq_lock();
+	key = k_spin_lock(&stack->lock);
+
+	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_stack, pop, stack, timeout);
 
 	if (likely(stack->next > stack->base)) {
 		stack->next--;
 		*data = *(stack->next);
-		irq_unlock(key);
+		k_spin_unlock(&stack->lock, key);
+
+		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, pop, stack, timeout, 0);
+
 		return 0;
 	}
 
-	if (timeout == K_NO_WAIT) {
-		irq_unlock(key);
+	SYS_PORT_TRACING_OBJ_FUNC_BLOCKING(k_stack, pop, stack, timeout);
+
+	if (K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		k_spin_unlock(&stack->lock, key);
+
+		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, pop, stack, timeout, -EBUSY);
+
 		return -EBUSY;
 	}
 
-	_pend_current_thread(&stack->wait_q, timeout);
+	result = z_pend_curr(&stack->lock, key, &stack->wait_q, timeout);
+	if (result == -EAGAIN) {
+		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, pop, stack, timeout, -EAGAIN);
 
-	result = _Swap(key);
-	if (result == 0) {
-		*data = (u32_t)_current->base.swap_data;
+		return -EAGAIN;
 	}
-	return result;
+
+	*data = (stack_data_t)_current->base.swap_data;
+
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_stack, pop, stack, timeout, 0);
+
+	return 0;
 }
+
+#ifdef CONFIG_USERSPACE
+static inline int z_vrfy_k_stack_pop(struct k_stack *stack,
+				     stack_data_t *data, k_timeout_t timeout)
+{
+	Z_OOPS(Z_SYSCALL_OBJ(stack, K_OBJ_STACK));
+	Z_OOPS(Z_SYSCALL_MEMORY_WRITE(data, sizeof(stack_data_t)));
+	return z_impl_k_stack_pop(stack, data, timeout);
+}
+#include <syscalls/k_stack_pop_mrsh.c>
+#endif

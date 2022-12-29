@@ -14,7 +14,14 @@
 
 #include <kernel.h>
 #include <init.h>
-#include <drivers/system_timer.h>
+#include <drivers/timer/system_timer.h>
 
-SYS_DEVICE_DEFINE("sys_clock", _sys_clock_driver_init, sys_clock_device_ctrl,
-		POST_KERNEL, CONFIG_SYSTEM_CLOCK_INIT_PRIORITY);
+/* Weak-linked noop defaults for optional driver interfaces*/
+
+void __weak sys_clock_set_timeout(int32_t ticks, bool idle)
+{
+}
+
+void __weak sys_clock_idle_exit(void)
+{
+}

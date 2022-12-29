@@ -8,8 +8,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define BLUETOOTH_HFP_MAX_MTU           140
-#define BLUETOOTH_HF_CLIENT_MAX_PDU     BLUETOOTH_HFP_MAX_MTU
+#define BT_HFP_MAX_MTU           140
+#define BT_HF_CLIENT_MAX_PDU     BT_HFP_MAX_MTU
 
 /* HFP AG Features */
 #define BT_HFP_AG_FEATURE_3WAY_CALL     0x00000001 /* Three-way calling */
@@ -41,16 +41,16 @@
 #define BT_HFP_HF_SUPPORTED_FEATURES    (BT_HFP_HF_FEATURE_CLI | \
 					 BT_HFP_HF_FEATURE_VOLUME)
 
-#define HF_MAX_BUF_LEN                  BLUETOOTH_HF_CLIENT_MAX_PDU
+#define HF_MAX_BUF_LEN                  BT_HF_CLIENT_MAX_PDU
 #define HF_MAX_AG_INDICATORS            20
 
 struct bt_hfp_hf {
 	struct bt_rfcomm_dlc rfcomm_dlc;
 	char hf_buffer[HF_MAX_BUF_LEN];
 	struct at_client at;
-	u32_t hf_features;
-	u32_t ag_features;
-	s8_t ind_table[HF_MAX_AG_INDICATORS];
+	uint32_t hf_features;
+	uint32_t ag_features;
+	int8_t ind_table[HF_MAX_AG_INDICATORS];
 };
 
 enum hfp_hf_ag_indicators {

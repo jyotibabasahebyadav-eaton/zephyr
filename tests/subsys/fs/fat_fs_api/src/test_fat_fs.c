@@ -4,13 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- * @filesystem
- * @brief test Zephyr file system generic features
- * to demonstrates the ZEPHYR File System APIs
- */
-
-#include <test_fat.h>
+#include "test_fat.h"
 
 static int test_statvfs(void)
 {
@@ -18,7 +12,7 @@ static int test_statvfs(void)
 	int res;
 
 	/* Verify fs_statvfs() */
-	res = fs_statvfs(&stat);
+	res = fs_statvfs(FATFS_MNTP, &stat);
 	if (res) {
 		TC_PRINT("Error getting volume stats [%d]\n", res);
 		return res;

@@ -6,17 +6,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <logging/log.h>
+LOG_MODULE_REGISTER(net_test, CONFIG_NET_TRICKLE_LOG_LEVEL);
+
 #include <zephyr/types.h>
+#include <ztest.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-#include <misc/printk.h>
-#include <sections.h>
+#include <sys/printk.h>
+#include <linker/sections.h>
 
 #include <tc_util.h>
 
-#include <net/ethernet.h>
 #include <net/buf.h>
 #include <net/net_ip.h>
 #include <net/net_if.h>
@@ -25,7 +28,7 @@
 
 #include "net_private.h"
 
-#if defined(CONFIG_NET_DEBUG_CONTEXT)
+#if defined(CONFIG_NET_TRICKLE_LOG_LEVEL_DBG)
 #define DBG(fmt, ...) printk(fmt, ##__VA_ARGS__)
 #else
 #define DBG(fmt, ...)
@@ -34,26 +37,26 @@
 static int token1 = 1, token2 = 2;
 
 static struct k_sem wait;
+static struct k_sem wait2;
 static bool cb_1_called;
 static bool cb_2_called;
-static bool test_failed;
 
-#define WAIT_TIME (2 * MSEC_PER_SEC)
+#define WAIT_TIME K_SECONDS(3)
 
 /* Set CHECK_LONG_TIMEOUT to 1 if you want to check longer timeout.
  * Do not do this for automated tests as those need to finish asap.
  */
 #define CHECK_LONG_TIMEOUT 0
 #if CHECK_LONG_TIMEOUT > 0
-#define WAIT_TIME_LONG (10 * MSEC_PER_SEC)
+#define WAIT_TIME_LONG K_SECONDS(10)
 #endif
 
 #define T1_IMIN 30
-#define T1_IMAX 100
+#define T1_IMAX 5
 #define T1_K 20
 
 #define T2_IMIN 80
-#define T2_IMAX 200
+#define T2_IMAX 3
 #define T2_K 40
 
 static struct net_trickle t1;
@@ -74,235 +77,143 @@ static void cb_2(struct net_trickle *trickle, bool do_suppress,
 {
 	TC_PRINT("Trickle 2 %p callback called\n", trickle);
 
-	k_sem_give(&wait);
+	k_sem_give(&wait2);
 
 	cb_2_called = true;
 }
 
-static bool test_trickle_create(void)
+static void test_trickle_create(void)
 {
 	int ret;
 
 	ret = net_trickle_create(&t1, T1_IMIN, T1_IMAX, T1_K);
-	if (ret) {
-		TC_ERROR("Trickle 1 create failed\n");
-		return false;
-	}
+	zassert_false(ret, "Trickle 1 create failed");
 
 	ret = net_trickle_create(&t2, T2_IMIN, T2_IMAX, T2_K);
-	if (ret) {
-		TC_ERROR("Trickle 2 create failed\n");
-		return false;
-	}
-
-	return true;
+	zassert_false(ret, "Trickle 2 create failed");
 }
 
-static bool test_trickle_start(void)
+static void test_trickle_start(void)
 {
 	int ret;
+
+	cb_1_called = false;
+	cb_2_called = false;
 
 	ret = net_trickle_start(&t1, cb_1, &t1);
-	if (ret) {
-		TC_ERROR("Trickle 1 start failed\n");
-		return false;
-	}
+	zassert_false(ret, "Trickle 1 start failed");
 
 	ret = net_trickle_start(&t2, cb_2, &t2);
-	if (ret) {
-		TC_ERROR("Trickle 2 start failed\n");
-		return false;
-	}
-
-	return true;
+	zassert_false(ret, "Trickle 2 start failed");
 }
 
-static bool test_trickle_stop(void)
+static void test_trickle_stop(void)
 {
-	int ret;
+	zassert_false(net_trickle_stop(&t1),
+			"Trickle 1 stop failed");
 
-	ret = net_trickle_stop(&t1);
-	if (ret) {
-		TC_ERROR("Trickle 1 stop failed\n");
-		return false;
-	}
-
-	ret = net_trickle_stop(&t2);
-	if (ret) {
-		TC_ERROR("Trickle 2 stop failed\n");
-		return false;
-	}
-
-	return true;
+	zassert_false(net_trickle_stop(&t2),
+			"Trickle 2 stop failed");
 }
 
-static bool test_trickle_1_status(void)
+static void test_trickle_1_status(void)
 {
-	if (!net_trickle_is_running(&t1)) {
-		TC_ERROR("Trickle 1 not running\n");
-		return false;
-	}
+	zassert_true(net_trickle_is_running(&t1), "Trickle 1 not running");
 
 	if (token1 != token2) {
 		net_trickle_inconsistency(&t1);
 	} else {
 		net_trickle_consistency(&t1);
 	}
-
-	return true;
 }
 
-static bool test_trickle_2_status(void)
+static void test_trickle_2_status(void)
 {
-	if (!net_trickle_is_running(&t2)) {
-		TC_ERROR("Trickle 2 not running\n");
-		return false;
-	}
+	zassert_true(net_trickle_is_running(&t2), "Trickle 2 not running");
 
 	if (token1 == token2) {
 		net_trickle_consistency(&t2);
 	} else {
 		net_trickle_inconsistency(&t2);
 	}
-
-	return true;
 }
 
-static bool test_trickle_1_wait(void)
+static void test_trickle_1_wait(void)
 {
-	cb_1_called = false;
 	k_sem_take(&wait, WAIT_TIME);
 
-	if (!cb_1_called) {
-		TC_ERROR("Trickle 1 no timeout\n");
-		return false;
-	}
+	zassert_true(cb_1_called, "Trickle 1 no timeout");
 
-	if (!net_trickle_is_running(&t1)) {
-		TC_ERROR("Trickle 1 not running\n");
-		return false;
-	}
-
-	return true;
+	zassert_true(net_trickle_is_running(&t1), "Trickle 1 not running");
 }
 
 #if CHECK_LONG_TIMEOUT > 0
-static bool test_trickle_1_wait_long(void)
+static void test_trickle_1_wait_long(void)
 {
 	cb_1_called = false;
+
 	k_sem_take(&wait, WAIT_TIME_LONG);
 
-	if (!cb_1_called) {
-		TC_ERROR("Trickle 1 no timeout\n");
-		return false;
-	}
+	zassert_false(cb_1_called, "Trickle 1 no timeout");
 
-	if (!net_trickle_is_running(&t1)) {
-		TC_ERROR("Trickle 1 not running\n");
-		return false;
-	}
-
-	return true;
+	zassert_true(net_trickle_is_running(&t1), "Trickle 1 not running");
+}
+#else
+static void test_trickle_1_wait_long(void)
+{
+	ztest_test_skip();
 }
 #endif
 
-static bool test_trickle_2_wait(void)
+static void test_trickle_2_wait(void)
 {
-	cb_2_called = false;
-	k_sem_take(&wait, WAIT_TIME);
+	k_sem_take(&wait2, WAIT_TIME);
 
-	if (!cb_2_called) {
-		TC_ERROR("Trickle 2 no timeout\n");
-		return false;
-	}
+	zassert_true(cb_2_called, "Trickle 2 no timeout");
 
-	if (!net_trickle_is_running(&t2)) {
-		TC_ERROR("Trickle 2 not running\n");
-		return false;
-	}
-
-	return true;
+	zassert_true(net_trickle_is_running(&t2), "Trickle 2 not running");
 }
 
-static bool test_trickle_1_stopped(void)
+static void test_trickle_1_stopped(void)
 {
-	if (net_trickle_is_running(&t1)) {
-		TC_ERROR("Trickle 1 running\n");
-		return false;
-	}
-
-	return true;
+	zassert_false(net_trickle_is_running(&t1), "Trickle 1 running");
 }
 
-static bool test_trickle_2_inc(void)
+static void test_trickle_2_inc(void)
 {
-	if (!net_trickle_is_running(&t2)) {
-		TC_ERROR("Trickle 2 is not running\n");
-		return false;
-	}
-
+	zassert_true(net_trickle_is_running(&t2), "Trickle 2 is not running");
 	token2++;
-
-	return true;
 }
 
-static bool test_trickle_1_update(void)
+static void test_trickle_1_update(void)
 {
-	if (!net_trickle_is_running(&t1)) {
-		TC_ERROR("Trickle 1 is not running\n");
-		return false;
-	}
+	zassert_true(net_trickle_is_running(&t1), "trickle 1 is not running");
 
 	token1 = token2;
-
-	return true;
 }
 
-static bool test_init(void)
+static void test_init(void)
 {
 	k_sem_init(&wait, 0, UINT_MAX);
-
-	return true;
+	k_sem_init(&wait2, 0, UINT_MAX);
 }
 
-static const struct {
-	const char *name;
-	bool (*func)(void);
-} tests[] = {
-	{ "trickle test init", test_init },
-	{ "trickle create", test_trickle_create },
-	{ "trickle start", test_trickle_start },
-	{ "trickle 1 check status", test_trickle_1_status },
-	{ "trickle 2 check status", test_trickle_2_status },
-	{ "trickle 1 wait timeout", test_trickle_1_wait },
-	{ "trickle 2 wait timeout", test_trickle_2_wait },
-	{ "trickle 1 update", test_trickle_1_update },
-	{ "trickle 1 check status", test_trickle_1_status },
-	{ "trickle 2 update", test_trickle_2_inc },
-	{ "trickle 2 check status", test_trickle_2_status },
-	{ "trickle 1 check status", test_trickle_1_status },
-
-#if CHECK_LONG_TIMEOUT > 0
-	{ "trickle 1 wait long timeout", test_trickle_1_wait_long },
-#endif
-	{ "trickle stop", test_trickle_stop },
-	{ "trickle 1 check stopped", test_trickle_1_stopped },
-};
-
-void main(void)
+/*test case main entry*/
+void test_main(void)
 {
-	int count, pass;
-
-	for (count = 0, pass = 0; count < ARRAY_SIZE(tests); count++) {
-		TC_START(tests[count].name);
-		test_failed = false;
-		if (!tests[count].func() || test_failed) {
-			TC_END(FAIL, "failed\n");
-		} else {
-			TC_END(PASS, "passed\n");
-			pass++;
-		}
-	}
-
-	TC_END_REPORT(((pass != ARRAY_SIZE(tests)) ? TC_FAIL : TC_PASS));
+	ztest_test_suite(test_tickle,
+			ztest_unit_test(test_init),
+			ztest_unit_test(test_trickle_create),
+			ztest_unit_test(test_trickle_start),
+			ztest_unit_test(test_trickle_1_status),
+			ztest_unit_test(test_trickle_2_status),
+			ztest_unit_test(test_trickle_1_wait),
+			ztest_unit_test(test_trickle_2_wait),
+			ztest_unit_test(test_trickle_1_update),
+			ztest_unit_test(test_trickle_2_inc),
+			ztest_unit_test(test_trickle_1_status),
+			ztest_unit_test(test_trickle_1_wait_long),
+			ztest_unit_test(test_trickle_stop),
+			ztest_unit_test(test_trickle_1_stopped));
+	ztest_run_test_suite(test_tickle);
 }

@@ -4,211 +4,169 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <logging/log.h>
+LOG_MODULE_REGISTER(net_test, LOG_LEVEL_WRN);
+
 #include <ztest.h>
+#include <net/socket.h>
 #include <net/mqtt.h>
+#include <random/rand32.h>
 
-#include <net/net_context.h>
-#include <net/net_pkt.h>
-
-#include <misc/printk.h>
 #include <string.h>
 #include <errno.h>
 
 #include "config.h"
 
-/* Container for some structures used by the MQTT subscriber app. */
-struct mqtt_client_ctx {
-	/**
-	 * The connect message structure is only used during the connect
-	 * stage. Developers must set some msg properties before calling the
-	 * mqtt_tx_connect routine. See below.
-	 */
-	struct mqtt_connect_msg connect_msg;
-	/**
-	 * This is the message that will be received by the server
-	 * (MQTT broker).
-	 */
-	struct mqtt_publish_msg pub_msg;
+#define BUFFER_SIZE 128
 
-	/**
-	 * This is the MQTT application context variable.
-	 */
-	struct mqtt_ctx mqtt_ctx;
+static uint8_t rx_buffer[BUFFER_SIZE];
+static uint8_t tx_buffer[BUFFER_SIZE];
+static struct mqtt_client client_ctx;
+static struct sockaddr broker;
+static struct zsock_pollfd fds[1];
+static int nfds;
+static bool connected;
 
-	/**
-	 * This variable will be passed to the connect callback, declared inside
-	 * the mqtt context struct. If not used, it could be set to NULL.
-	 */
-	void *connect_data;
-
-	/**
-	 * This variable will be passed to the disconnect callback, declared
-	 * inside the mqtt context struct. If not used, it could be set to NULL.
-	 */
-	void *disconnect_data;
-
-	/**
-	 * This variable will be passed to the subscribe_tx callback, declared
-	 * inside the mqtt context struct. If not used, it could be set to NULL.
-	 */
-	void *subscribe_data;
-
-	/**
-	 * This variable will be passed to the unsubscribe_tx callback, declared
-	 * inside the mqtt context struct. If not used, it could be set to NULL.
-	 */
-	void *unsubscribe_data;
-};
-
-/* This is the network context structure. */
-static struct net_context *net_ctx;
-
-/* The mqtt client struct */
-static struct mqtt_client_ctx client_ctx;
-
-/* This routine sets some basic properties for the network context variable */
-static int network_setup(struct net_context **net_ctx, const char *local_addr,
-			 const char *server_addr, u16_t server_port);
-
-/* The signature of this routine must match the connect callback declared at
- * the mqtt.h header.
- */
-static void connect_cb(struct mqtt_ctx *mqtt_ctx)
+static void broker_init(void)
 {
-	struct mqtt_client_ctx *client_ctx;
+#if defined(CONFIG_NET_IPV6)
+	struct sockaddr_in6 *broker6 = net_sin6(&broker);
 
-	client_ctx = CONTAINER_OF(mqtt_ctx, struct mqtt_client_ctx, mqtt_ctx);
+	broker6->sin6_family = AF_INET6;
+	broker6->sin6_port = htons(SERVER_PORT);
+	zsock_inet_pton(AF_INET6, SERVER_ADDR, &broker6->sin6_addr);
+#else
+	struct sockaddr_in *broker4 = net_sin(&broker);
 
-	printk("[%s:%d]", __func__, __LINE__);
-
-	if (client_ctx->connect_data) {
-		printk(" user_data: %s",
-		       (const char *)client_ctx->connect_data);
-	}
-
-	printk("\n");
+	broker4->sin_family = AF_INET;
+	broker4->sin_port = htons(SERVER_PORT);
+	zsock_inet_pton(AF_INET, SERVER_ADDR, &broker4->sin_addr);
+#endif
 }
 
-/* The signature of this routine must match the disconnect callback declared at
- * the mqtt.h header.
- */
-static void disconnect_cb(struct mqtt_ctx *mqtt_ctx)
+static void prepare_fds(struct mqtt_client *client)
 {
-	struct mqtt_client_ctx *client_ctx;
-
-	client_ctx = CONTAINER_OF(mqtt_ctx, struct mqtt_client_ctx, mqtt_ctx);
-
-	printk("[%s:%d]", __func__, __LINE__);
-
-	if (client_ctx->disconnect_data) {
-		printk(" user_data: %s",
-		       (const char *)client_ctx->disconnect_data);
+	if (client->transport.type == MQTT_TRANSPORT_NON_SECURE) {
+		fds[0].fd = client->transport.tcp.sock;
 	}
 
-	printk("\n");
+	fds[0].events = ZSOCK_POLLIN;
+	nfds = 1;
 }
 
-/**
- * The signature of this routine must match the publish_rx callback declared at
- * the mqtt.h header.
- *
- * NOTE: we have two callbacks for MQTT Publish related stuff:
- *	- publish_tx, for publishers
- *	- publish_rx, for subscribers
- *
- * Applications must keep a "message database" with pkt_id's. So far, this is
- * not implemented here. For example, if we receive a PUBREC message with an
- * unknown pkt_id, this routine must return an error, for example -EINVAL or
- * any negative value.
- */
-static int publish_rx_cb(struct mqtt_ctx *mqtt_ctx, struct mqtt_publish_msg
-		*msg, u16_t pkt_id, enum mqtt_packet type)
+static void clear_fds(void)
 {
-	struct mqtt_client_ctx *client_ctx;
-	const char *str;
-	int rc = 0;
+	nfds = 0;
+}
 
-	client_ctx = CONTAINER_OF(mqtt_ctx, struct mqtt_client_ctx, mqtt_ctx);
+static void wait(int timeout)
+{
+	if (nfds > 0) {
+		if (zsock_poll(fds, nfds, timeout) < 0) {
+			TC_PRINT("poll error: %d\n", errno);
+		}
+	}
+}
 
-	switch (type) {
-	case MQTT_PUBLISH:
-		str = "MQTT_PUBLISH";
-		printk("[%s:%d] <%s> msg: %s", __func__, __LINE__,
-				str, msg->msg);
+void mqtt_evt_handler(struct mqtt_client *const client,
+		      const struct mqtt_evt *evt)
+{
+	int err;
+
+	switch (evt->type) {
+	case MQTT_EVT_CONNACK:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT connect failed %d\n", evt->result);
+			break;
+		}
+
+		connected = true;
+		TC_PRINT("[%s:%d] MQTT_EVT_CONNACK: Connected!\n",
+			 __func__, __LINE__);
+
 		break;
-	case MQTT_PUBREL:
-		str = "MQTT_PUBREL";
-		printk("[%s:%d] <%s> packet id: %u", __func__, __LINE__,
-				str, pkt_id);
-		return 0;
+
+	case MQTT_EVT_DISCONNECT:
+		TC_PRINT("[%s:%d] MQTT_EVT_DISCONNECT: disconnected %d\n",
+			 __func__, __LINE__, evt->result);
+
+		connected = false;
+		clear_fds();
+
+		break;
+
+	case MQTT_EVT_PUBACK:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT PUBACK error %d\n", evt->result);
+			break;
+		}
+
+		TC_PRINT("[%s:%d] MQTT_EVT_PUBACK packet id: %u\n",
+			 __func__, __LINE__, evt->param.puback.message_id);
+
+		break;
+
+	case MQTT_EVT_PUBREC:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT PUBREC error %d\n", evt->result);
+			break;
+		}
+
+		TC_PRINT("[%s:%d] MQTT_EVT_PUBREC packet id: %u\n",
+			 __func__, __LINE__, evt->param.pubrec.message_id);
+
+		const struct mqtt_pubrel_param rel_param = {
+			.message_id = evt->param.pubrec.message_id
+		};
+
+		err = mqtt_publish_qos2_release(client, &rel_param);
+		if (err != 0) {
+			TC_PRINT("Failed to send MQTT PUBREL: %d\n",
+				 err);
+		}
+
+		break;
+
+	case MQTT_EVT_PUBCOMP:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT PUBCOMP error %d\n", evt->result);
+			break;
+		}
+
+		TC_PRINT("[%s:%d] MQTT_EVT_PUBCOMP packet id: %u\n",
+			 __func__, __LINE__, evt->param.pubcomp.message_id);
+
+		break;
+
+	case MQTT_EVT_SUBACK:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT SUBACK error %d\n", evt->result);
+			break;
+		}
+
+
+		TC_PRINT("[%s:%d] items: %d packet id: %u\n", __func__,
+			 __LINE__, evt->param.suback.return_codes.len,
+			 evt->param.suback.message_id);
+
+
+		break;
+
+	case MQTT_EVT_UNSUBACK:
+		if (evt->result != 0) {
+			TC_PRINT("MQTT UNSUBACK error %d\n", evt->result);
+			break;
+		}
+
+		TC_PRINT("[%s:%d] packet id: %u\n", __func__, __LINE__,
+			 evt->param.unsuback.message_id);
+
+		break;
+
 	default:
-		rc = -EINVAL;
-		str = "Invalid MQTT packet";
+		TC_PRINT("[%s:%d] Invalid MQTT packet\n", __func__, __LINE__);
+		break;
 	}
-
-	if (client_ctx->subscribe_data) {
-		printk(", user_data: %s",
-		       (const char *)client_ctx->subscribe_data);
-	}
-
-	printk("\n");
-
-	return rc;
-}
-
-/**
- * The signature of this routine must match the subscribe callback declared at
- * the mqtt.h header.
- */
-static int subscriber_cb(struct mqtt_ctx *mqtt_ctx, u16_t pkt_id,
-		u8_t items, enum mqtt_qos qos[])
-{
-	struct mqtt_client_ctx *client_ctx;
-
-	client_ctx = CONTAINER_OF(mqtt_ctx, struct mqtt_client_ctx, mqtt_ctx);
-
-	printk("[%s:%d] items: %d packet id: %u", __func__, __LINE__,
-			items, pkt_id);
-
-	if (client_ctx->subscribe_data) {
-		printk(" user_data: %s",
-				(const char *)client_ctx->subscribe_data);
-	}
-
-	printk("\n");
-
-	return 0;
-}
-
-/**
- * The signature of this routine must match the unsubscribe callback declared at
- * the mqtt.h header.
- */
-static int unsubscribe_cb(struct mqtt_ctx *mqtt_ctx, u16_t pkt_id)
-{
-	struct mqtt_client_ctx *client_ctx;
-
-	client_ctx = CONTAINER_OF(mqtt_ctx, struct mqtt_client_ctx, mqtt_ctx);
-
-	printk("[%s:%d] packet id: %u", __func__, __LINE__, pkt_id);
-
-	if (client_ctx->unsubscribe_data) {
-		printk(" user_data: %s",
-				(const char *)client_ctx->unsubscribe_data);
-	}
-
-	printk("\n");
-
-	return 0;
-}
-
-/**
- * The signature of this routine must match the malformed callback declared at
- * the mqtt.h header.
- */
-static void malformed_cb(struct mqtt_ctx *mqtt_ctx, u16_t pkt_type)
-{
-	printk("[%s:%d] pkt_type: %u\n", __func__, __LINE__, pkt_type);
 }
 
 static char *get_mqtt_topic(void)
@@ -216,95 +174,58 @@ static char *get_mqtt_topic(void)
 	return "sensors";
 }
 
-#define RC_STR(rc)	((rc) == 0 ? "OK" : "ERROR")
+static void client_init(struct mqtt_client *client)
+{
+	mqtt_client_init(client);
 
-#define PRINT_RESULT(func, rc)	\
-	printk("[%s:%d] %s: %d <%s>\n", __func__, __LINE__, \
-	       (func), rc, RC_STR(rc))
+	broker_init();
+
+	/* MQTT client configuration */
+	client->broker = &broker;
+	client->evt_cb = mqtt_evt_handler;
+	client->client_id.utf8 = (uint8_t *)MQTT_CLIENTID;
+	client->client_id.size = strlen(MQTT_CLIENTID);
+	client->password = NULL;
+	client->user_name = NULL;
+	client->protocol_version = MQTT_VERSION_3_1_1;
+	client->transport.type = MQTT_TRANSPORT_NON_SECURE;
+
+	client->rx_buf = rx_buffer;
+	client->rx_buf_size = sizeof(rx_buffer);
+	client->tx_buf = tx_buffer;
+	client->tx_buf_size = sizeof(tx_buffer);
+}
 
 /* In this routine we block until the connected variable is 1 */
-static int try_to_connect(struct mqtt_client_ctx *client_ctx)
+static int try_to_connect(struct mqtt_client *client)
 {
-	int i = 0;
+	int rc, i = 0;
 
-	while (i++ < APP_CONNECT_TRIES && !client_ctx->mqtt_ctx.connected) {
-		int rc;
+	while (i++ < APP_CONNECT_TRIES && !connected) {
 
-		rc = mqtt_tx_connect(&client_ctx->mqtt_ctx,
-				     &client_ctx->connect_msg);
-		k_sleep(APP_SLEEP_MSECS);
+		client_init(&client_ctx);
+
+		rc = mqtt_connect(client);
 		if (rc != 0) {
+			k_sleep(K_MSEC(APP_SLEEP_MSECS));
 			continue;
+		}
+
+		prepare_fds(client);
+
+		wait(APP_SLEEP_MSECS);
+		mqtt_input(client);
+
+		if (!connected) {
+			mqtt_abort(client);
 		}
 	}
 
-	if (client_ctx->mqtt_ctx.connected) {
-		return TC_PASS;
+	if (connected) {
+		return 0;
 	}
 
-	return TC_FAIL;
-}
-
-static int init_network(void)
-{
-	int rc;
-
-	/* The net_ctx variable must be ready BEFORE passing it to the MQTT API.
-	 */
-	rc = network_setup(&net_ctx, ZEPHYR_ADDR, SERVER_ADDR, SERVER_PORT);
-	if (rc != 0) {
-		goto exit_app;
-	}
-
-	/* Set everything to 0 and later just assign the required fields. */
-	memset(&client_ctx, 0x00, sizeof(client_ctx));
-
-	/* The network context is the only field that must be set BEFORE
-	 * calling the mqtt_init routine.
-	 */
-	client_ctx.mqtt_ctx.net_ctx = net_ctx;
-
-	/* connect, disconnect and malformed may be set to NULL */
-	client_ctx.mqtt_ctx.connect = connect_cb;
-
-	client_ctx.mqtt_ctx.disconnect = disconnect_cb;
-
-	client_ctx.mqtt_ctx.malformed = malformed_cb;
-
-	client_ctx.mqtt_ctx.subscribe = subscriber_cb;
-
-	client_ctx.mqtt_ctx.unsubscribe = unsubscribe_cb;
-
-	client_ctx.mqtt_ctx.net_timeout = APP_TX_RX_TIMEOUT;
-
-	/* Publisher apps TX the MQTT PUBLISH msg */
-	client_ctx.mqtt_ctx.publish_rx = publish_rx_cb;
-
-	rc = mqtt_init(&client_ctx.mqtt_ctx, MQTT_APP_SUBSCRIBER);
-	if (rc != 0) {
-		goto exit_app;
-	}
-
-	/* The connect message will be sent to the MQTT server (broker).
-	 * If clean_session here is 0, the mqtt_ctx clean_session variable
-	 * will be set to 0 also. Please don't do that, set always to 1.
-	 * Clean session = 0 is not yet supported.
-	 */
-	client_ctx.connect_msg.client_id = MQTT_CLIENTID;
-	client_ctx.connect_msg.client_id_len = strlen(MQTT_CLIENTID);
-	client_ctx.connect_msg.clean_session = 1;
-
-	client_ctx.connect_data = "CONNECTED";
-	client_ctx.disconnect_data = "DISCONNECTED";
-	client_ctx.subscribe_data = "SUBSCRIBE";
-	client_ctx.unsubscribe_data = "UNSUBSCRIBE";
-
-	return TC_PASS;
-
-exit_app:
-	net_context_put(net_ctx);
-
-	return TC_FAIL;
+	return -EINVAL;
 }
 
 static int test_connect(void)
@@ -322,16 +243,23 @@ static int test_connect(void)
 static int test_subscribe(void)
 {
 	int rc;
-	const char *topic_sub = get_mqtt_topic();
-	u16_t pkt_id_sub = sys_rand32_get();
-	static enum mqtt_qos  mqtt_qos_sub[1];
+	struct mqtt_topic topic;
+	struct mqtt_subscription_list sub;
 
-	rc = mqtt_tx_subscribe(&client_ctx.mqtt_ctx, pkt_id_sub, 1,
-			&topic_sub, mqtt_qos_sub);
-	k_sleep(APP_SLEEP_MSECS);
+	topic.topic.utf8 = get_mqtt_topic();
+	topic.topic.size = strlen(topic.topic.utf8);
+	topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
+	sub.list = &topic;
+	sub.list_count = 1U;
+	sub.message_id = sys_rand32_get();
+
+	rc = mqtt_subscribe(&client_ctx, &sub);
 	if (rc != 0) {
 		return TC_FAIL;
 	}
+
+	wait(APP_SLEEP_MSECS);
+	mqtt_input(&client_ctx);
 
 	return TC_PASS;
 }
@@ -339,15 +267,22 @@ static int test_subscribe(void)
 static int test_unsubscribe(void)
 {
 	int rc;
-	const char *topic_sub = get_mqtt_topic();
-	u16_t pkt_id_unsub = sys_rand32_get();
+	struct mqtt_topic topic;
+	struct mqtt_subscription_list unsub;
 
-	rc = mqtt_tx_unsubscribe(&client_ctx.mqtt_ctx, pkt_id_unsub,
-			1, &topic_sub);
-	k_sleep(APP_SLEEP_MSECS);
+	topic.topic.utf8 = get_mqtt_topic();
+	topic.topic.size = strlen(topic.topic.utf8);
+	unsub.list = &topic;
+	unsub.list_count = 1U;
+	unsub.message_id = sys_rand32_get();
+
+	rc = mqtt_unsubscribe(&client_ctx, &unsub);
 	if (rc != 0) {
 		return TC_FAIL;
 	}
+
+	wait(APP_SLEEP_MSECS);
+	mqtt_input(&client_ctx);
 
 	return TC_PASS;
 }
@@ -356,110 +291,14 @@ static int test_disconnect(void)
 {
 	int rc;
 
-	rc = mqtt_tx_disconnect(&client_ctx.mqtt_ctx);
+	rc = mqtt_disconnect(&client_ctx);
 	if (rc != 0) {
 		return TC_FAIL;
 	}
 
+	wait(APP_SLEEP_MSECS);
+
 	return TC_PASS;
-}
-
-static int set_addr(struct sockaddr *sock_addr, const char *addr, u16_t port)
-{
-	void *ptr;
-	int rc;
-
-#ifdef CONFIG_NET_IPV6
-	net_sin6(sock_addr)->sin6_port = htons(port);
-	sock_addr->family = AF_INET6;
-	ptr = &(net_sin6(sock_addr)->sin6_addr);
-	rc = net_addr_pton(AF_INET6, addr, ptr);
-#else
-	net_sin(sock_addr)->sin_port = htons(port);
-	sock_addr->family = AF_INET;
-	ptr = &(net_sin(sock_addr)->sin_addr);
-	rc = net_addr_pton(AF_INET, addr, ptr);
-#endif
-
-	if (rc) {
-		printk("Invalid IP address: %s\n", addr);
-	}
-
-	return rc;
-}
-
-static int network_setup(struct net_context **net_ctx, const char *local_addr,
-		const char *server_addr, u16_t server_port)
-{
-#ifdef CONFIG_NET_IPV6
-	socklen_t addr_len = sizeof(struct sockaddr_in6);
-	sa_family_t family = AF_INET6;
-
-#else
-	socklen_t addr_len = sizeof(struct sockaddr_in);
-	sa_family_t family = AF_INET;
-#endif
-	struct sockaddr server_sock, local_sock;
-	void *p;
-	int rc;
-
-	rc = set_addr(&local_sock, local_addr, 0);
-	if (rc) {
-		printk("set_addr (local) error\n");
-		return rc;
-	}
-
-#ifdef CONFIG_NET_IPV6
-	p = net_if_ipv6_addr_add(net_if_get_default(),
-			&net_sin6(&local_sock)->sin6_addr,
-			NET_ADDR_MANUAL, 0);
-#else
-	p = net_if_ipv4_addr_add(net_if_get_default(),
-			&net_sin(&local_sock)->sin_addr,
-			NET_ADDR_MANUAL, 0);
-#endif
-
-	if (!p) {
-		return -EINVAL;
-	}
-
-	rc = net_context_get(family, SOCK_STREAM, IPPROTO_TCP, net_ctx);
-	if (rc) {
-		printk("net_context_get error\n");
-		return rc;
-	}
-
-	rc = net_context_bind(*net_ctx, &local_sock, addr_len);
-	if (rc) {
-		printk("net_context_bind error\n");
-		goto lb_exit;
-	}
-
-	rc = set_addr(&server_sock, server_addr, server_port);
-	if (rc) {
-		printk("set_addr (server) error\n");
-		goto lb_exit;
-	}
-
-	rc = net_context_connect(*net_ctx, &server_sock, addr_len, NULL,
-			APP_SLEEP_MSECS, NULL);
-	if (rc) {
-		printk("net_context_connect error\n"
-				"Is the server (broker) up and running?\n");
-		goto lb_exit;
-	}
-
-	return 0;
-
-lb_exit:
-	net_context_put(*net_ctx);
-
-	return rc;
-}
-
-void test_mqtt_init(void)
-{
-	zassert_true(init_network() == TC_PASS, NULL);
 }
 
 void test_mqtt_connect(void)

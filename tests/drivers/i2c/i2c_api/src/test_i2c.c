@@ -12,30 +12,27 @@
  * @}
  */
 
-#include <i2c.h>
+#include <drivers/i2c.h>
 #include <zephyr.h>
 #include <ztest.h>
 
-#ifdef CONFIG_ARC
-#define I2C_DEV_NAME CONFIG_I2C_SS_0_NAME
+#if DT_NODE_HAS_STATUS(DT_ALIAS(i2c_0), okay)
+#define I2C_DEV_NAME	DT_LABEL(DT_ALIAS(i2c_0))
+#elif DT_NODE_HAS_STATUS(DT_ALIAS(i2c_1), okay)
+#define I2C_DEV_NAME	DT_LABEL(DT_ALIAS(i2c_1))
+#elif DT_NODE_HAS_STATUS(DT_ALIAS(i2c_2), okay)
+#define I2C_DEV_NAME	DT_LABEL(DT_ALIAS(i2c_2))
 #else
-#define I2C_DEV_NAME CONFIG_I2C_0_NAME
+#error "Please set the correct I2C device"
 #endif
 
-static union dev_config i2c_cfg = {
-	.raw = 0,
-	.bits = {
-		.use_10_bit_addr = 0,
-		.is_master_device = 1,
-		.speed = I2C_SPEED_STANDARD,
-		.is_slave_read = 0,
-	},
-};
+uint32_t i2c_cfg = I2C_SPEED_SET(I2C_SPEED_STANDARD) | I2C_MODE_MASTER;
 
 static int test_gy271(void)
 {
 	unsigned char datas[6];
-	struct device *i2c_dev = device_get_binding(I2C_DEV_NAME);
+	const struct device *i2c_dev = device_get_binding(I2C_DEV_NAME);
+	uint32_t i2c_cfg_tmp;
 
 	if (!i2c_dev) {
 		TC_PRINT("Cannot get I2C device\n");
@@ -43,15 +40,25 @@ static int test_gy271(void)
 	}
 
 	/* 1. Verify i2c_configure() */
-	if (i2c_configure(i2c_dev, i2c_cfg.raw)) {
+	if (i2c_configure(i2c_dev, i2c_cfg)) {
 		TC_PRINT("I2C config failed\n");
+		return TC_FAIL;
+	}
+
+	/* 2. Verify i2c_get_config() */
+	if (i2c_get_config(i2c_dev, &i2c_cfg_tmp)) {
+		TC_PRINT("I2C get_config failed\n");
+		return TC_FAIL;
+	}
+	if (i2c_cfg != i2c_cfg_tmp) {
+		TC_PRINT("I2C get_config returned invalid config\n");
 		return TC_FAIL;
 	}
 
 	datas[0] = 0x01;
 	datas[1] = 0x20;
 
-	/* 2. verify i2c_write() */
+	/* 3. verify i2c_write() */
 	if (i2c_write(i2c_dev, datas, 2, 0x1E)) {
 		TC_PRINT("Fail to configure sensor GY271\n");
 		return TC_FAIL;
@@ -64,7 +71,7 @@ static int test_gy271(void)
 		return TC_FAIL;
 	}
 
-	k_sleep(1);
+	k_sleep(K_MSEC(1));
 
 	datas[0] = 0x03;
 	if (i2c_write(i2c_dev, datas, 1, 0x1E)) {
@@ -72,9 +79,9 @@ static int test_gy271(void)
 		return TC_FAIL;
 	}
 
-	memset(datas, 0, sizeof(datas));
+	(void)memset(datas, 0, sizeof(datas));
 
-	/* 3. verify i2c_read() */
+	/* 4. verify i2c_read() */
 	if (i2c_read(i2c_dev, datas, 6, 0x1E)) {
 		TC_PRINT("Fail to fetch sample from sensor GY271\n");
 		return TC_FAIL;
@@ -90,7 +97,8 @@ static int test_gy271(void)
 static int test_burst_gy271(void)
 {
 	unsigned char datas[6];
-	struct device *i2c_dev = device_get_binding(I2C_DEV_NAME);
+	const struct device *i2c_dev = device_get_binding(I2C_DEV_NAME);
+	uint32_t i2c_cfg_tmp;
 
 	if (!i2c_dev) {
 		TC_PRINT("Cannot get I2C device\n");
@@ -98,8 +106,18 @@ static int test_burst_gy271(void)
 	}
 
 	/* 1. verify i2c_configure() */
-	if (i2c_configure(i2c_dev, i2c_cfg.raw)) {
+	if (i2c_configure(i2c_dev, i2c_cfg)) {
 		TC_PRINT("I2C config failed\n");
+		return TC_FAIL;
+	}
+
+	/* 2. Verify i2c_get_config() */
+	if (i2c_get_config(i2c_dev, &i2c_cfg_tmp)) {
+		TC_PRINT("I2C get_config failed\n");
+		return TC_FAIL;
+	}
+	if (i2c_cfg != i2c_cfg_tmp) {
+		TC_PRINT("I2C get_config returned invalid config\n");
 		return TC_FAIL;
 	}
 
@@ -108,17 +126,17 @@ static int test_burst_gy271(void)
 	datas[2] = 0x02;
 	datas[3] = 0x00;
 
-	/* 2. verify i2c_burst_write() */
+	/* 3. verify i2c_burst_write() */
 	if (i2c_burst_write(i2c_dev, 0x1E, 0x00, datas, 4)) {
 		TC_PRINT("Fail to write to sensor GY271\n");
 		return TC_FAIL;
 	}
 
-	k_sleep(1);
+	k_sleep(K_MSEC(1));
 
-	memset(datas, 0, sizeof(datas));
+	(void)memset(datas, 0, sizeof(datas));
 
-	/* 3. verify i2c_burst_read() */
+	/* 4. verify i2c_burst_read() */
 	if (i2c_burst_read(i2c_dev, 0x1E, 0x03, datas, 6)) {
 		TC_PRINT("Fail to fetch sample from sensor GY271\n");
 		return TC_FAIL;

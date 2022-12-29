@@ -1,122 +1,47 @@
-# Kconfig - DMA configuration options
-#
-#
+# DMA configuration options
+
 # Copyright (c) 2016 Intel Corporation
-#
 # SPDX-License-Identifier: Apache-2.0
-#
 
 #
 # DMA options
 #
 menuconfig DMA
-	bool
-	prompt "DMA driver Configuration"
-	default n
+	bool "DMA driver Configuration"
 
 if DMA
-menuconfig DMA_QMSI
-	bool "Enable QMSI DMA driver"
-	default n
-	depends on QMSI
+config DMA_64BIT
+	bool "DMA 64 bit address support"
 	help
-	QMSI DMA driver.
+	  When this option is true, 64 bit source and dest
+	  DMA addresses are supported.
 
-menuconfig DMA_STM32F4X
-	bool "Enable STM32F4x DMA driver"
-	default n
-	depends on SOC_SERIES_STM32F4X
+config DMA_INIT_PRIORITY
+	int "DMA init priority"
+	default KERNEL_INIT_PRIORITY_DEFAULT
 	help
-	DMA driver for STM32F4x series SoCs.
+	  DMA driver device initialization priority.
 
-config DMA_0_NAME
-	string "Device name for DMA Controller 0"
-	default "DMA_0"
-	help
-	Device name for DMA Controller 0.
+module = DMA
+module-str = dma
+source "subsys/logging/Kconfig.template.log_config"
 
-config DMA_0_IRQ_PRI
-	int "IRQ Priority for DMA Controller 0"
-	default 3
-	help
-	IRQ Priority for the DMA Controller.
+source "drivers/dma/Kconfig.stm32"
 
-config DMA_0_RX_SUB_CHANNEL_ID
-	int "Requested RX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication from a peripheral/device.  Not required
-	for memory to memory comms.
+source "drivers/dma/Kconfig.sam_xdmac"
 
-config DMA_0_TX_SUB_CHANNEL_ID
-	int "Requested TX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication to a peripheral/device.  Not required
-	for memory to memory comms.
+source "drivers/dma/Kconfig.dw"
 
-config DMA_1_NAME
-	string "Device name for DMA Controller 1"
-	default "DMA_1"
-	help
-	Device name for DMA Controller 1.
+source "drivers/dma/Kconfig.nios2_msgdma"
 
-config DMA_1_IRQ_PRI
-	int "IRQ Priority for DMA Controller 1"
-	default 3
-	help
-	IRQ Priority for DMA Controller 1.
+source "drivers/dma/Kconfig.sam0"
 
-config DMA_1_RX_SUB_CHANNEL_ID
-	int "Requested RX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication from a peripheral/device.  Not required
-	for memory to memory comms.
+source "drivers/dma/Kconfig.mcux_edma"
 
-config DMA_1_TX_SUB_CHANNEL_ID
-	int "Requested TX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication to a peripheral/device.  Not required
-	for memory to memory comms.
+source "drivers/dma/Kconfig.mcux_lpc"
 
-config DMA_2_NAME
-	string "Device name for DMA Controller 2"
-	default "DMA_2"
-	help
-	Device name for DMA Controller 2.
+source "drivers/dma/Kconfig.dma_pl330"
 
-config DMA_2_IRQ_PRI
-	int "IRQ Priority for DMA Controller 2"
-	default 3
-	help
-	IRQ Priority for DMA Controller 2.
-
-config DMA_2_RX_SUB_CHANNEL_ID
-	int "Requested RX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication from a peripheral/device.  Not required
-	for memory to memory comms.
-
-config DMA_2_TX_SUB_CHANNEL_ID
-	int "Requested TX sub-channel ID"
-	default 0
-	depends on DMA_STM32F4X
-	help
-	This configuration is required to choose a valid sub-channel
-	for communication to a peripheral/device.  Not required
-	for memory to memory comms.
+source "drivers/dma/Kconfig.iproc_pax"
 
 endif # DMA

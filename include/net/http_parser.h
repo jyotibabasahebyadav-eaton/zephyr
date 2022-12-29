@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+
 /* Copyright Joyent, Inc. and other Node contributors. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,11 +20,8 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-#ifndef _HTTP_PARSER_H_
-#define _HTTP_PARSER_H_
-#ifdef __cplusplus
-extern "C" {
-#endif
+#ifndef ZEPHYR_INCLUDE_NET_HTTP_PARSER_H_
+#define ZEPHYR_INCLUDE_NET_HTTP_PARSER_H_
 
 /* Also update SONAME in the Makefile whenever you change these. */
 #define HTTP_PARSER_VERSION_MAJOR 2
@@ -34,17 +33,23 @@ extern "C" {
 	(!defined(_MSC_VER) || _MSC_VER < 1600) && !defined(__WINE__)
 #include <BaseTsd.h>
 #include <stddef.h>
-typedef __int8 s8_t;
-typedef unsigned __int8 u8_t;
-typedef __int16 s16_t;
-typedef unsigned __int16 u16_t;
-typedef __int32 s32_t;
-typedef unsigned __int32 u32_t;
-typedef __int64 s64_t;
-typedef unsigned __int64 u64_t;
+typedef __int8 int8_t;
+typedef unsigned __int8 uint8_t;
+typedef __int16 int16_t;
+typedef unsigned __int16 uint16_t;
+typedef __int32 int32_t;
+typedef unsigned __int32 uint32_t;
+typedef __int64 int64_t;
+typedef unsigned __int64 uint64_t;
 #else
 #include <zephyr/types.h>
 #include <stddef.h>
+#endif
+#include <net/http_parser_state.h>
+#include <net/http_parser_url.h>
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 /* Maximium header size allowed. If the macro is not defined
@@ -72,7 +77,7 @@ struct http_parser_settings;
  * chunked' headers that indicate the presence of a body.
  *
  * Returning `2` from on_headers_complete will tell parser that it should not
- * expect neither a body nor any futher responses on this connection. This is
+ * expect neither a body nor any further responses on this connection. This is
  * useful for handling responses to a CONNECT request which may not contain
  * `Upgrade` or `Connection: upgrade` headers.
  *
@@ -186,8 +191,8 @@ struct http_parser {
 	unsigned int index : 7;        /* index into current matcher */
 	unsigned int lenient_http_headers : 1;
 
-	u32_t nread;          /* # bytes read in various scenarios */
-	u64_t content_length; /* # bytes in body (0 if no Content-Length
+	uint32_t nread;          /* # bytes read in various scenarios */
+	uint64_t content_length; /* # bytes in body (0 if no Content-Length
 				  * header)
 				  */
 	/** READ-ONLY **/
@@ -209,6 +214,11 @@ struct http_parser {
 	void *data; /* A pointer to get hook to the "connection" or "socket"
 		     * object
 		     */
+
+	/* Remote socket address of http connection, where parser can initiate
+	 * replies if necessary.
+	 */
+	const struct sockaddr *addr;
 };
 
 
@@ -226,38 +236,6 @@ struct http_parser_settings {
 	 */
 	http_cb      on_chunk_header;
 	http_cb      on_chunk_complete;
-};
-
-
-enum http_parser_url_fields {
-	  UF_SCHEMA           = 0
-	, UF_HOST             = 1
-	, UF_PORT             = 2
-	, UF_PATH             = 3
-	, UF_QUERY            = 4
-	, UF_FRAGMENT         = 5
-	, UF_USERINFO         = 6
-	, UF_MAX              = 7
-};
-
-
-/* Result structure for http_parser_parse_url().
- *
- * Callers should index into field_data[] with UF_* values iff field_set
- * has the relevant (1 << UF_*) bit set. As a courtesy to clients (and
- * because we probably have padding left over), we convert any port to
- * a u16_t.
- */
-struct http_parser_url {
-	u16_t field_set;           /* Bitmask of (1 << UF_*) values */
-	u16_t port;                /* Converted UF_PORT string */
-
-	struct {
-		u16_t off;               /* Offset into buffer in which field
-					     * starts
-					     */
-		u16_t len;               /* Length of run in buffer */
-	} field_data[UF_MAX];
 };
 
 
@@ -305,13 +283,6 @@ const char *http_errno_name(enum http_errno err);
 
 /* Return a string description of the given error */
 const char *http_errno_description(enum http_errno err);
-
-/* Initialize all http_parser_url members to 0 */
-void http_parser_url_init(struct http_parser_url *u);
-
-/* Parse a URL; return nonzero on failure */
-int http_parser_parse_url(const char *buf, size_t buflen,
-			  int is_connect, struct http_parser_url *u);
 
 /* Pause or un-pause the parser; a nonzero value pauses */
 void http_parser_pause(struct http_parser *parser, int paused);

@@ -4,39 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- * @addtogroup t_uart_basic
- * @{
- * @defgroup t_uart_poll test_uart_poll
- * @brief TestPurpose: verify UART works well in poll mode
- * @details
- * - Test Steps
- *    - Poll Output:
- *      -# Output the prepared data using uart_poll_out(), and compare
- *         the output characters with the original characters.
- *    - Poll Input:
- *      -# Wait for data from UART console using uart_poll_in(). User sends
- *         data to UART console using echo "qwer" > /dev/ttyUSB* and waits
- *         for uart_poll_in() exit.
- * - Expected Results
- *   -# When test UART poll out, the return value from uart_poll_out()
- *      will be equal to the character sent out.
- *   -# When test UART poll in, the app will wait for input from UART
- *      console and exit after receiving '\n'.
- * @}
- */
-
-#include <test_uart.h>
+#include "test_uart.h"
 
 static const char *poll_data = "This is a POLL test.\r\n";
 
 static int test_poll_in(void)
 {
-	unsigned char recvChar;
-	struct device *uart_dev = device_get_binding(UART_DEVICE_NAME);
+	unsigned char recv_char;
+	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-	if (!uart_dev) {
-		TC_PRINT("Cannot get UART device\n");
+	if (!device_is_ready(uart_dev)) {
+		TC_PRINT("UART device not ready\n");
 		return TC_FAIL;
 	}
 
@@ -44,12 +22,14 @@ static int test_poll_in(void)
 
 	/* Verify uart_poll_in() */
 	while (1) {
-		while (uart_poll_in(uart_dev, &recvChar) < 0)
-			;
+		while (uart_poll_in(uart_dev, &recv_char) < 0) {
+			/* Allow other thread/workqueue to work. */
+			k_yield();
+		}
 
-		TC_PRINT("%c", recvChar);
+		TC_PRINT("%c", recv_char);
 
-		if ((recvChar == '\n') || (recvChar == '\r')) {
+		if ((recv_char == '\n') || (recv_char == '\r')) {
 			break;
 		}
 	}
@@ -60,23 +40,16 @@ static int test_poll_in(void)
 static int test_poll_out(void)
 {
 	int i;
-	unsigned char sentChar;
-	struct device *uart_dev = device_get_binding(UART_DEVICE_NAME);
+	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-	if (!uart_dev) {
-		TC_PRINT("Cannot get UART device\n");
+	if (!device_is_ready(uart_dev)) {
+		TC_PRINT("UART device not ready\n");
 		return TC_FAIL;
 	}
 
 	/* Verify uart_poll_out() */
 	for (i = 0; i < strlen(poll_data); i++) {
-		sentChar = uart_poll_out(uart_dev, poll_data[i]);
-
-		if (sentChar != poll_data[i]) {
-			TC_PRINT("expect send %c, actaul send %c\n",
-						poll_data[i], sentChar);
-			return TC_FAIL;
-		}
+		uart_poll_out(uart_dev, poll_data[i]);
 	}
 
 	return TC_PASS;

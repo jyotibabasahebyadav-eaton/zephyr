@@ -15,7 +15,7 @@ using a telnet client.
 Requirements
 ************
 
-- :ref:`Networking with Qemu <networking_with_qemu>`
+- :ref:`networking_with_qemu`
 
 
 Building and Running
@@ -27,27 +27,16 @@ QEMU x86
 These are instructions for how to use this sample application using
 QEMU on a Linux host connected to a network with DHCP service.
 
-To use QEMU for testing, follow the :ref:`Networking with Qemu
-<networking_with_qemu>` guide.
-
-Run 'loop_socat' and 'loop-slip-tap' scripts from net-tools.
-
-.. code-block:: console
-
-    $ ./loop_socat.sh
-
-In another window:
-
-.. code-block:: console
-
-    $ sudo ./loop-slip-tap.sh
+To use QEMU for testing, follow the :ref:`networking_with_qemu` guide.
 
 Run Zephyr samples/net/telnet application in QEMU:
 
-.. code-block:: console
-
-    $ cd $ZEPHYR_BASE/samples/net/telnet
-    $ make pristine && make run
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/telnet
+   :host-os: unix
+   :board: qemu_x86
+   :goals: run
+   :compact:
 
 Once started, you should see you IP address details for example:
 
@@ -85,14 +74,15 @@ logs, follow the  :ref:`Freedom-K64F board <frdm_k64f>` documentation section.
 
 Connect ethernet cable from :ref:`Freedom-K64F <frdm_k64f>` board to a
 local network providing IPv4 address configuration via DHCPv4. Creating your own
-dhcp server on a local network is not in the scope of this README.
+DHCP server on a local network is not in the scope of this README.
 
 Build Zephyr samples/net/telnet application:
 
-.. code-block:: console
-
-    $ cd $ZEPHYR_BASE/samples/net/dhcpv4_client
-    $ make pristine && make BOARD=frdm_k64f
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/telnet
+   :board: frdm_k64f
+   :goals: build
+   :compact:
 
 Flash the resulting Zephyr binary following the :ref:`Freedom-K64F <frdm_k64f>`
 board documentation noted above.

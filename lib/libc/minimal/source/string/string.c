@@ -7,6 +7,8 @@
  */
 
 #include <string.h>
+#include <stdint.h>
+#include <sys/types.h>
 
 /**
  *
@@ -15,7 +17,7 @@
  * @return pointer to destination buffer <d>
  */
 
-char *strcpy(char *_MLIBC_RESTRICT d, const char *_MLIBC_RESTRICT s)
+char *strcpy(char *ZRESTRICT d, const char *ZRESTRICT s)
 {
 	char *dest = d;
 
@@ -37,7 +39,7 @@ char *strcpy(char *_MLIBC_RESTRICT d, const char *_MLIBC_RESTRICT s)
  * @return pointer to destination buffer <d>
  */
 
-char *strncpy(char *_MLIBC_RESTRICT d, const char *_MLIBC_RESTRICT s, size_t n)
+char *strncpy(char *ZRESTRICT d, const char *ZRESTRICT s, size_t n)
 {
 	char *dest = d;
 
@@ -68,8 +70,9 @@ char *strchr(const char *s, int c)
 {
 	char tmp = (char) c;
 
-	while ((*s != tmp) && (*s != '\0'))
+	while ((*s != tmp) && (*s != '\0')) {
 		s++;
+	}
 
 	return (*s == tmp) ? (char *) s : NULL;
 }
@@ -115,6 +118,25 @@ size_t strlen(const char *s)
 
 /**
  *
+ * @brief Get fixed-size string length
+ *
+ * @return number of bytes in fixed-size string <s>
+ */
+
+size_t strnlen(const char *s, size_t maxlen)
+{
+	size_t n = 0;
+
+	while (*s != '\0' && n < maxlen) {
+		s++;
+		n++;
+	}
+
+	return n;
+}
+
+/**
+ *
  * @brief Compare two strings
  *
  * @return negative # if <s1> < <s2>, 0 if <s1> == <s2>, else positive #
@@ -148,13 +170,52 @@ int strncmp(const char *s1, const char *s2, size_t n)
 	return (n == 0) ? 0 : (*s1 - *s2);
 }
 
-char *strcat(char *_MLIBC_RESTRICT dest, const char *_MLIBC_RESTRICT src)
+/**
+ * @brief Separate `str` by any char in `sep` and return NULL terminated
+ * sections. Consecutive `sep` chars in `str` are treated as a single
+ * separator.
+ *
+ * @return pointer to NULL terminated string or NULL on errors.
+ */
+char *strtok_r(char *str, const char *sep, char **state)
+{
+	char *start, *end;
+
+	start = str ? str : *state;
+
+	/* skip leading delimiters */
+	while (*start && strchr(sep, *start)) {
+		start++;
+	}
+
+	if (*start == '\0') {
+		*state = start;
+		return NULL;
+	}
+
+	/* look for token chars */
+	end = start;
+	while (*end && !strchr(sep, *end)) {
+		end++;
+	}
+
+	if (*end != '\0') {
+		*end = '\0';
+		*state = end + 1;
+	} else {
+		*state = end;
+	}
+
+	return start;
+}
+
+char *strcat(char *ZRESTRICT dest, const char *ZRESTRICT src)
 {
 	strcpy(dest + strlen(dest), src);
 	return dest;
 }
 
-char *strncat(char *_MLIBC_RESTRICT dest, const char *_MLIBC_RESTRICT src,
+char *strncat(char *ZRESTRICT dest, const char *ZRESTRICT src,
 	      size_t n)
 {
 	char *orig_dest = dest;
@@ -180,8 +241,9 @@ int memcmp(const void *m1, const void *m2, size_t n)
 	const char *c1 = m1;
 	const char *c2 = m2;
 
-	if (!n)
+	if (!n) {
 		return 0;
+	}
 
 	while ((--n > 0) && (*c1 == *c2)) {
 		c1++;
@@ -203,7 +265,7 @@ void *memmove(void *d, const void *s, size_t n)
 	char *dest = d;
 	const char *src  = s;
 
-	if ((size_t) (d - s) < n) {
+	if ((size_t) (dest - src) < n) {
 		/*
 		 * The <src> buffer overlaps with the start of the <dest> buffer.
 		 * Copy backwards to prevent the premature corruption of <src>.
@@ -233,38 +295,42 @@ void *memmove(void *d, const void *s, size_t n)
  * @return pointer to start of destination buffer
  */
 
-void *memcpy(void *_MLIBC_RESTRICT d, const void *_MLIBC_RESTRICT s, size_t n)
+void *memcpy(void *ZRESTRICT d, const void *ZRESTRICT s, size_t n)
 {
 	/* attempt word-sized copying only if buffers have identical alignment */
 
 	unsigned char *d_byte = (unsigned char *)d;
 	const unsigned char *s_byte = (const unsigned char *)s;
 
-	if ((((unsigned int)d ^ (unsigned int)s_byte) & 0x3) == 0) {
+#if !defined(CONFIG_MINIMAL_LIBC_OPTIMIZE_STRING_FOR_SIZE)
+	const uintptr_t mask = sizeof(mem_word_t) - 1;
+
+	if ((((uintptr_t)d ^ (uintptr_t)s_byte) & mask) == 0) {
 
 		/* do byte-sized copying until word-aligned or finished */
 
-		while (((unsigned int)d_byte) & 0x3) {
+		while (((uintptr_t)d_byte) & mask) {
 			if (n == 0) {
 				return d;
 			}
 			*(d_byte++) = *(s_byte++);
 			n--;
-		};
+		}
 
 		/* do word-sized copying as long as possible */
 
-		unsigned int *d_word = (unsigned int *)d_byte;
-		const unsigned int *s_word = (const unsigned int *)s_byte;
+		mem_word_t *d_word = (mem_word_t *)d_byte;
+		const mem_word_t *s_word = (const mem_word_t *)s_byte;
 
-		while (n >= sizeof(unsigned int)) {
+		while (n >= sizeof(mem_word_t)) {
 			*(d_word++) = *(s_word++);
-			n -= sizeof(unsigned int);
+			n -= sizeof(mem_word_t);
 		}
 
 		d_byte = (unsigned char *)d_word;
 		s_byte = (unsigned char *)s_word;
 	}
+#endif
 
 	/* do byte-sized copying until finished */
 
@@ -290,30 +356,35 @@ void *memset(void *buf, int c, size_t n)
 	unsigned char *d_byte = (unsigned char *)buf;
 	unsigned char c_byte = (unsigned char)c;
 
-	while (((unsigned int)d_byte) & 0x3) {
+#if !defined(CONFIG_MINIMAL_LIBC_OPTIMIZE_STRING_FOR_SIZE)
+	while (((uintptr_t)d_byte) & (sizeof(mem_word_t) - 1)) {
 		if (n == 0) {
 			return buf;
 		}
 		*(d_byte++) = c_byte;
 		n--;
-	};
+	}
 
 	/* do word-sized initialization as long as possible */
 
-	unsigned int *d_word = (unsigned int *)d_byte;
-	unsigned int c_word = (unsigned int)(unsigned char)c;
+	mem_word_t *d_word = (mem_word_t *)d_byte;
+	mem_word_t c_word = (mem_word_t)c_byte;
 
 	c_word |= c_word << 8;
 	c_word |= c_word << 16;
+#if Z_MEM_WORD_T_WIDTH > 32
+	c_word |= c_word << 32;
+#endif
 
-	while (n >= sizeof(unsigned int)) {
+	while (n >= sizeof(mem_word_t)) {
 		*(d_word++) = c_word;
-		n -= sizeof(unsigned int);
+		n -= sizeof(mem_word_t);
 	}
 
 	/* do byte-sized initialization until finished */
 
 	d_byte = (unsigned char *)d_word;
+#endif
 
 	while (n > 0) {
 		*(d_byte++) = c_byte;
@@ -330,13 +401,13 @@ void *memset(void *buf, int c, size_t n)
  * @return pointer to start of found byte
  */
 
-void *memchr(const void *s, unsigned char c, size_t n)
+void *memchr(const void *s, int c, size_t n)
 {
 	if (n != 0) {
 		const unsigned char *p = s;
 
 		do {
-			if (*p++ == c) {
+			if (*p++ == (unsigned char)c) {
 				return ((void *)(p - 1));
 			}
 

@@ -13,35 +13,21 @@ information to a serial console.
 Requirements
 ************
 
-- :ref:`networking with Qemu <networking_with_qemu>`
+- :ref:`networking_with_host`
 
 Building and Running
 ********************
 
-QEMU x86
-========
+Running DHCPv4 client in Linux Host
+===================================
 
 These are instructions for how to use this sample application using
 QEMU on a Linux host to negotiate IP address from DHCPv4 server running
 on Linux host.
 
-Follow readme from:
+To use QEMU for testing, follow the :ref:`networking_with_qemu` guide.
 
-    Run 'loop_socat' and 'loop-slip-tap' scripts from net-tools.
-
-    https://github.com/zephyrproject-rtos/net-tools
-
-.. code-block:: console
-
-    $ ./loop_socat.sh
-
-In another window:
-
-.. code-block:: console
-
-    $ sudo ./loop-slip-tap.sh
-
-Here's a sample server configuration file '/etc/dhcpd/dhcp.conf'
+Here's a sample server configuration file '/etc/dhcp/dhcpd.conf'
 used to configure the DHCPv4 server:
 
 .. code-block:: console
@@ -63,10 +49,12 @@ using this conf file:
 
 Run Zephyr samples/net/dhcpv4_client application in QEMU:
 
-.. code-block:: console
-
-    $ cd $ZEPHYR_BASE/samples/net/dhcpv4_client
-    $ make pristine && make qemu
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/dhcpv4_client
+   :host-os: unix
+   :board: qemu_x86
+   :goals: run
+   :compact:
 
 Once DHCPv4 client address negotiation completed with server, details
 are shown like this:
@@ -131,11 +119,12 @@ using this conf file:
 
 Build Zephyr samples/net/dhcpv4_client application:
 
-.. code-block:: console
-
-    $ cd $ZEPHYR_BASE/samples/net/dhcpv4_client
-    $ make pristine && make BOARD=frdm_k64f
-    $ cp outdir/frdm_k64f/zephyr.bin /media/rveerama/MBED/
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/dhcpv4_client
+   :host-os: unix
+   :board: frdm_k64f
+   :goals: build flash
+   :compact:
 
 Once DHCPv4 client address negotiation completed with server, details
 are shown like this:

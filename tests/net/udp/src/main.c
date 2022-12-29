@@ -6,8 +6,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define NET_LOG_LEVEL CONFIG_NET_UDP_LOG_LEVEL
+
+#include <logging/log.h>
+LOG_MODULE_REGISTER(net_test, NET_LOG_LEVEL);
+
 #include <zephyr.h>
-#include <sections.h>
+#include <linker/sections.h>
 
 #include <zephyr/types.h>
 #include <stddef.h>
@@ -16,44 +21,57 @@
 #include <errno.h>
 #include <device.h>
 #include <init.h>
-#include <misc/printk.h>
+#include <sys/printk.h>
 #include <net/buf.h>
 #include <net/net_core.h>
 #include <net/net_pkt.h>
 #include <net/net_ip.h>
 #include <net/ethernet.h>
+#include <net/dummy.h>
+#include <net/udp.h>
+#include <random/rand32.h>
 
-#include <tc_util.h>
+#include "ipv4.h"
+#include "ipv6.h"
 
-#if defined(CONFIG_NET_DEBUG_UDP)
+#include <ztest.h>
+
+#if NET_LOG_LEVEL >= LOG_LEVEL_DBG
 #define DBG(fmt, ...) printk(fmt, ##__VA_ARGS__)
 #else
 #define DBG(fmt, ...)
 #endif
 
-#include "udp.h"
-#include "net_private.h"
+#include "udp_internal.h"
 
+#if NET_LOG_LEVEL >= LOG_LEVEL_DBG
+#define NET_LOG_ENABLED 1
+#endif
+#include "net_private.h"
+#include "ipv4.h"
+
+static bool test_failed;
 static bool fail = true;
 static struct k_sem recv_lock;
+static char payload[] = { 'f', 'o', 'o', 'b', 'a', 'r', '\0' };
 
 struct net_udp_context {
-	u8_t mac_addr[sizeof(struct net_eth_addr)];
+	uint8_t mac_addr[sizeof(struct net_eth_addr)];
 	struct net_linkaddr ll_addr;
 };
 
-int net_udp_dev_init(struct device *dev)
+int net_udp_dev_init(const struct device *dev)
 {
-	struct net_udp_context *net_udp_context = dev->driver_data;
+	struct net_udp_context *net_udp_context = dev->data;
 
 	net_udp_context = net_udp_context;
 
 	return 0;
 }
 
-static u8_t *net_udp_get_mac(struct device *dev)
+static uint8_t *net_udp_get_mac(const struct device *dev)
 {
-	struct net_udp_context *context = dev->driver_data;
+	struct net_udp_context *context = dev->data;
 
 	if (context->mac_addr[2] == 0x00) {
 		/* 00-00-5E-00-53-xx Documentation RFC 7042 */
@@ -70,14 +88,14 @@ static u8_t *net_udp_get_mac(struct device *dev)
 
 static void net_udp_iface_init(struct net_if *iface)
 {
-	u8_t *mac = net_udp_get_mac(net_if_get_device(iface));
+	uint8_t *mac = net_udp_get_mac(net_if_get_device(iface));
 
 	net_if_set_link_addr(iface, mac, 6, NET_LINK_ETHERNET);
 }
 
 static int send_status = -EINVAL;
 
-static int tester_send(struct net_if *iface, struct net_pkt *pkt)
+static int tester_send(const struct device *dev, struct net_pkt *pkt)
 {
 	if (!pkt->frags) {
 		DBG("No data to send!\n");
@@ -85,8 +103,6 @@ static int tester_send(struct net_if *iface, struct net_pkt *pkt)
 	}
 
 	DBG("Data was sent successfully\n");
-
-	net_pkt_unref(pkt);
 
 	send_status = 0;
 
@@ -98,10 +114,13 @@ static inline struct in_addr *if_get_addr(struct net_if *iface)
 	int i;
 
 	for (i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
-		if (iface->ipv4.unicast[i].is_used &&
-		    iface->ipv4.unicast[i].address.family == AF_INET &&
-		    iface->ipv4.unicast[i].addr_state == NET_ADDR_PREFERRED) {
-			return &iface->ipv4.unicast[i].address.in_addr;
+		if (iface->config.ip.ipv4->unicast[i].is_used &&
+		    iface->config.ip.ipv4->unicast[i].address.family ==
+								AF_INET &&
+		    iface->config.ip.ipv4->unicast[i].addr_state ==
+							NET_ADDR_PREFERRED) {
+			return
+			    &iface->config.ip.ipv4->unicast[i].address.in_addr;
 		}
 	}
 
@@ -110,8 +129,8 @@ static inline struct in_addr *if_get_addr(struct net_if *iface)
 
 struct net_udp_context net_udp_context_data;
 
-static struct net_if_api net_udp_if_api = {
-	.init = net_udp_iface_init,
+static struct dummy_api net_udp_if_api = {
+	.iface_api.init = net_udp_iface_init,
 	.send = tester_send,
 };
 
@@ -119,15 +138,16 @@ static struct net_if_api net_udp_if_api = {
 #define _ETH_L2_CTX_TYPE NET_L2_GET_CTX_TYPE(DUMMY_L2)
 
 NET_DEVICE_INIT(net_udp_test, "net_udp_test",
-		net_udp_dev_init, &net_udp_context_data, NULL,
+		net_udp_dev_init, NULL,
+		&net_udp_context_data, NULL,
 		CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
 		&net_udp_if_api, _ETH_L2_LAYER, _ETH_L2_CTX_TYPE, 127);
 
 struct ud {
 	const struct sockaddr *remote_addr;
 	const struct sockaddr *local_addr;
-	u16_t remote_port;
-	u16_t local_port;
+	uint16_t remote_port;
+	uint16_t local_port;
 	char *test;
 	void *handle;
 };
@@ -136,6 +156,8 @@ static struct ud *returned_ud;
 
 static enum net_verdict test_ok(struct net_conn *conn,
 				struct net_pkt *pkt,
+				union net_ip_header *ip_hdr,
+				union net_proto_header *proto_hdr,
 				void *user_data)
 {
 	struct ud *ud = (struct ud *)user_data;
@@ -161,6 +183,8 @@ static enum net_verdict test_ok(struct net_conn *conn,
 
 static enum net_verdict test_fail(struct net_conn *conn,
 				  struct net_pkt *pkt,
+				  union net_ip_header *ip_hdr,
+				  union net_proto_header *proto_hdr,
 				  void *user_data)
 {
 	/* This function should never be called as there should not
@@ -171,99 +195,74 @@ static enum net_verdict test_fail(struct net_conn *conn,
 	return NET_DROP;
 }
 
-static void setup_ipv6_udp(struct net_pkt *pkt,
-			   struct in6_addr *remote_addr,
-			   struct in6_addr *local_addr,
-			   u16_t remote_port,
-			   u16_t local_port)
-{
-	NET_IPV6_HDR(pkt)->vtc = 0x60;
-	NET_IPV6_HDR(pkt)->tcflow = 0;
-	NET_IPV6_HDR(pkt)->flow = 0;
-	NET_IPV6_HDR(pkt)->len[0] = 0;
-	NET_IPV6_HDR(pkt)->len[1] = NET_UDPH_LEN;
+uint8_t ipv6_hop_by_hop_ext_hdr[] = {
+/* Next header UDP */
+0x11,
+/* Length (multiple of 8 octets) */
+0x0C,
+/* Experimental extension */
+0x3e,
+/* Length in bytes */
+0x20,
+0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+0x49, 0x4A, 0x4B, 0x4C, 0x4E, 0x4F, 0x50, 0x51,
+0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+0x5A, 0x5B, 0x5C, 0x5D, 0x5F, 0x60, 0x61, 0x62,
+/* Another experimental extension */
+0x3e,
+/* Length in bytes */
+0x20,
+0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A,
+0x6B, 0x6C, 0x6D, 0x6F, 0x70, 0x71, 0x72, 0x73,
+0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B,
+0x7C, 0x7D, 0x7E, 0x21, 0x22, 0x23, 0x24, 0x25,
+/* Another experimental extension */
+0x3e,
+/* Length in bytes */
+0x20,
+0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D,
+0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
+0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45,
+};
 
-	NET_IPV6_HDR(pkt)->nexthdr = IPPROTO_UDP;
-	NET_IPV6_HDR(pkt)->hop_limit = 255;
-
-	net_ipaddr_copy(&NET_IPV6_HDR(pkt)->src, remote_addr);
-	net_ipaddr_copy(&NET_IPV6_HDR(pkt)->dst, local_addr);
-
-	net_pkt_set_ip_hdr_len(pkt, sizeof(struct net_ipv6_hdr));
-
-	NET_UDP_HDR(pkt)->src_port = htons(remote_port);
-	NET_UDP_HDR(pkt)->dst_port = htons(local_port);
-
-	net_pkt_set_ipv6_ext_len(pkt, 0);
-
-	net_buf_add(pkt->frags, net_pkt_ip_hdr_len(pkt) +
-				sizeof(struct net_udp_hdr));
-}
-
-static void setup_ipv4_udp(struct net_pkt *pkt,
-			   struct in_addr *remote_addr,
-			   struct in_addr *local_addr,
-			   u16_t remote_port,
-			   u16_t local_port)
-{
-	NET_IPV4_HDR(pkt)->vhl = 0x45;
-	NET_IPV4_HDR(pkt)->tos = 0;
-	NET_IPV4_HDR(pkt)->len[0] = 0;
-	NET_IPV4_HDR(pkt)->len[1] = NET_UDPH_LEN +
-		sizeof(struct net_ipv4_hdr);
-
-	NET_IPV4_HDR(pkt)->proto = IPPROTO_UDP;
-
-	net_ipaddr_copy(&NET_IPV4_HDR(pkt)->src, remote_addr);
-	net_ipaddr_copy(&NET_IPV4_HDR(pkt)->dst, local_addr);
-
-	net_pkt_set_ip_hdr_len(pkt, sizeof(struct net_ipv4_hdr));
-
-	NET_UDP_HDR(pkt)->src_port = htons(remote_port);
-	NET_UDP_HDR(pkt)->dst_port = htons(local_port);
-
-	net_pkt_set_ipv6_ext_len(pkt, 0);
-
-	net_buf_add(pkt->frags, net_pkt_ip_hdr_len(pkt) +
-				sizeof(struct net_udp_hdr));
-}
-
-#define TIMEOUT 200
+#define TIMEOUT K_MSEC(200)
 
 static bool send_ipv6_udp_msg(struct net_if *iface,
 			      struct in6_addr *src,
 			      struct in6_addr *dst,
-			      u16_t src_port,
-			      u16_t dst_port,
+			      uint16_t src_port,
+			      uint16_t dst_port,
 			      struct ud *ud,
 			      bool expect_failure)
 {
 	struct net_pkt *pkt;
-	struct net_buf *frag;
 	int ret;
 
-	pkt = net_pkt_get_reserve_tx(0, K_FOREVER);
-	frag = net_pkt_get_frag(pkt, K_FOREVER);
-	net_pkt_frag_add(pkt, frag);
+	pkt = net_pkt_alloc_with_buffer(iface, 0, AF_INET6,
+					IPPROTO_UDP, K_SECONDS(1));
+	zassert_not_null(pkt, "Out of mem");
 
-	net_pkt_set_iface(pkt, iface);
-	net_pkt_set_ll_reserve(pkt, net_buf_headroom(frag));
+	if (net_ipv6_create(pkt, src, dst) ||
+	    net_udp_create(pkt, htons(src_port), htons(dst_port))) {
+		printk("Cannot create IPv6 UDP pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
 
-	setup_ipv6_udp(pkt, src, dst, src_port, dst_port);
+	net_pkt_cursor_init(pkt);
+	net_ipv6_finalize(pkt, IPPROTO_UDP);
 
 	ret = net_recv_data(iface, pkt);
 	if (ret < 0) {
 		printk("Cannot recv pkt %p, ret %d\n", pkt, ret);
-		return false;
+		zassert_true(0, "exiting");
 	}
 
 	if (k_sem_take(&recv_lock, TIMEOUT)) {
-		printk("Timeout, packet not received\n");
-		if (expect_failure) {
-			return false;
-		} else {
-			return true;
-		}
+
+		/**TESTPOINT: Check for failure*/
+		zassert_true(expect_failure, "Timeout, packet not received");
+		return true;
 	}
 
 	/* Check that the returned user data is the same as what was given
@@ -272,7 +271,75 @@ static bool send_ipv6_udp_msg(struct net_if *iface,
 	if (ud != returned_ud && !expect_failure) {
 		printk("IPv6 wrong user data %p returned, expected %p\n",
 		       returned_ud, ud);
-		return false;
+		zassert_true(0, "exiting");
+	}
+
+	return !fail;
+}
+
+static bool send_ipv6_udp_long_msg(struct net_if *iface,
+				   struct in6_addr *src,
+				   struct in6_addr *dst,
+				   uint16_t src_port,
+				   uint16_t dst_port,
+				   struct ud *ud,
+				   bool expect_failure)
+{
+	struct net_pkt *pkt;
+	int ret;
+
+	pkt = net_pkt_alloc_with_buffer(iface,
+					sizeof(ipv6_hop_by_hop_ext_hdr) +
+					sizeof(payload), AF_INET6,
+					IPPROTO_UDP, K_SECONDS(1));
+	zassert_not_null(pkt, "Out of mem");
+
+	if (net_ipv6_create(pkt, src, dst)) {
+		printk("Cannot create IPv6  pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
+
+	if (net_pkt_write(pkt, (uint8_t *)ipv6_hop_by_hop_ext_hdr,
+			      sizeof(ipv6_hop_by_hop_ext_hdr))) {
+		printk("Cannot write IPv6 ext header pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
+
+	net_pkt_set_ipv6_ext_len(pkt, sizeof(ipv6_hop_by_hop_ext_hdr));
+	net_pkt_set_ipv6_next_hdr(pkt, NET_IPV6_NEXTHDR_HBHO);
+
+	if (net_udp_create(pkt, htons(src_port), htons(dst_port))) {
+		printk("Cannot create IPv6  pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
+
+	if (net_pkt_write(pkt, (uint8_t *)payload, sizeof(payload))) {
+		printk("Cannot write IPv6 ext header pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_ipv6_finalize(pkt, IPPROTO_UDP);
+
+	ret = net_recv_data(iface, pkt);
+	if (ret < 0) {
+		printk("Cannot recv pkt %p, ret %d\n", pkt, ret);
+		zassert_true(0, "exiting");
+	}
+
+	if (k_sem_take(&recv_lock, TIMEOUT)) {
+		/**TESTPOINT: Check for failure*/
+		zassert_true(expect_failure, "Timeout, packet not received");
+		return true;
+	}
+
+	/* Check that the returned user data is the same as what was given
+	 * as a parameter.
+	 */
+	if (ud != returned_ud && !expect_failure) {
+		printk("IPv6 wrong user data %p returned, expected %p\n",
+		       returned_ud, ud);
+		zassert_true(0, "exiting");
 	}
 
 	return !fail;
@@ -281,37 +348,38 @@ static bool send_ipv6_udp_msg(struct net_if *iface,
 static bool send_ipv4_udp_msg(struct net_if *iface,
 			      struct in_addr *src,
 			      struct in_addr *dst,
-			      u16_t src_port,
-			      u16_t dst_port,
+			      uint16_t src_port,
+			      uint16_t dst_port,
 			      struct ud *ud,
 			      bool expect_failure)
 {
 	struct net_pkt *pkt;
-	struct net_buf *frag;
 	int ret;
 
-	pkt = net_pkt_get_reserve_tx(0, K_FOREVER);
-	frag = net_pkt_get_frag(pkt, K_FOREVER);
-	net_pkt_frag_add(pkt, frag);
+	pkt = net_pkt_alloc_with_buffer(iface, 0, AF_INET,
+					IPPROTO_UDP, K_SECONDS(1));
+	zassert_not_null(pkt, "Out of mem");
 
-	net_pkt_set_iface(pkt, iface);
-	net_pkt_set_ll_reserve(pkt, net_buf_headroom(frag));
+	if (net_ipv4_create(pkt, src, dst) ||
+	    net_udp_create(pkt, htons(src_port), htons(dst_port))) {
+		printk("Cannot create IPv4 UDP pkt %p", pkt);
+		zassert_true(0, "exiting");
+	}
 
-	setup_ipv4_udp(pkt, src, dst, src_port, dst_port);
+	net_pkt_cursor_init(pkt);
+	net_ipv4_finalize(pkt, IPPROTO_UDP);
 
 	ret = net_recv_data(iface, pkt);
 	if (ret < 0) {
 		printk("Cannot recv pkt %p, ret %d\n", pkt, ret);
-		return false;
+		zassert_true(0, "exiting");
 	}
 
 	if (k_sem_take(&recv_lock, TIMEOUT)) {
-		printk("Timeout, packet not received\n");
-		if (expect_failure) {
-			return false;
-		} else {
-			return true;
-		}
+
+		/**TESTPOINT: Check for failure*/
+		zassert_true(expect_failure, "Timeout, packet not received");
+		return true;
 	}
 
 	/* Check that the returned user data is the same as what was given
@@ -320,15 +388,15 @@ static bool send_ipv4_udp_msg(struct net_if *iface,
 	if (ud != returned_ud && !expect_failure) {
 		printk("IPv4 wrong user data %p returned, expected %p\n",
 		       returned_ud, ud);
-		return false;
+		zassert_true(0, "exiting");
 	}
 
 	return !fail;
 }
 
 static void set_port(sa_family_t family, struct sockaddr *raddr,
-		     struct sockaddr *laddr, u16_t rport,
-		     u16_t lport)
+		     struct sockaddr *laddr, uint16_t rport,
+		     uint16_t lport)
 {
 	if (family == AF_INET6) {
 		if (raddr) {
@@ -351,10 +419,19 @@ static void set_port(sa_family_t family, struct sockaddr *raddr,
 	}
 }
 
-static bool run_tests(void)
+void test_udp(void)
 {
+	if (IS_ENABLED(CONFIG_NET_TC_THREAD_COOPERATIVE)) {
+		k_thread_priority_set(k_current_get(),
+				K_PRIO_COOP(CONFIG_NUM_COOP_PRIORITIES - 1));
+	} else {
+		k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(9));
+	}
+
+	test_failed = false;
+
 	struct net_conn_handle *handlers[CONFIG_NET_MAX_CONN];
-	struct net_if *iface = net_if_get_default();
+	struct net_if *iface;
 	struct net_if_addr *ifaddr;
 	struct ud *ud;
 	int ret, i = 0;
@@ -380,6 +457,8 @@ static bool run_tests(void)
 	struct sockaddr_in peer_addr4;
 	struct in_addr in4addr_peer = { { { 192, 0, 2, 9 } } };
 
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+
 	net_ipaddr_copy(&any_addr6.sin6_addr, &in6addr_any);
 	any_addr6.sin6_family = AF_INET6;
 
@@ -404,14 +483,14 @@ static bool run_tests(void)
 	if (!ifaddr) {
 		printk("Cannot add %s to interface %p\n",
 		       net_sprint_ipv6_addr(&in6addr_my), iface);
-		return false;
+		zassert_true(0, "exiting");
 	}
 
 	ifaddr = net_if_ipv4_addr_add(iface, &in4addr_my, NET_ADDR_MANUAL, 0);
 	if (!ifaddr) {
 		printk("Cannot add %s to interface %p\n",
 		       net_sprint_ipv4_addr(&in4addr_my), iface);
-		return false;
+		zassert_true(0, "exiting");
 	}
 
 #define REGISTER(family, raddr, laddr, rport, lport)			\
@@ -422,34 +501,38 @@ static bool run_tests(void)
 		user_data.local_addr =  (struct sockaddr *)laddr;	\
 		user_data.remote_port = rport;				\
 		user_data.local_port = lport;				\
-		user_data.test = #raddr"-"#laddr"-"#rport"-"#lport;	\
+		user_data.test = "DST="#raddr"-SRC="#laddr"-RP="#rport	\
+			"-LP="#lport;					\
 									\
 		set_port(family, (struct sockaddr *)raddr,		\
 			 (struct sockaddr *)laddr, rport, lport);	\
 									\
-		ret = net_udp_register((struct sockaddr *)raddr,	\
+		ret = net_udp_register(family,				\
+				       (struct sockaddr *)raddr,	\
 				       (struct sockaddr *)laddr,	\
 				       rport, lport,			\
-				       test_ok, &user_data,		\
+				       NULL, test_ok, &user_data,	\
 				       &handlers[i]);			\
 		if (ret) {						\
 			printk("UDP register %s failed (%d)\n",		\
 			       user_data.test, ret);			\
-			return false;					\
+			zassert_true(0, "exiting");			\
 		}							\
 		user_data.handle = handlers[i++];			\
 		&user_data;						\
 	})
 
 #define REGISTER_FAIL(raddr, laddr, rport, lport)			\
-	ret = net_udp_register((struct sockaddr *)raddr,		\
+	ret = net_udp_register(AF_INET,					\
+			       (struct sockaddr *)raddr,		\
 			       (struct sockaddr *)laddr,		\
 			       rport, lport,				\
-			       test_fail, INT_TO_POINTER(0), NULL);	\
+			       NULL, test_fail, INT_TO_POINTER(0),	\
+			       NULL);					\
 	if (!ret) {							\
 		printk("UDP register invalid match %s failed\n",	\
-		       #raddr"-"#laddr"-"#rport"-"#lport);		\
-		return false;						\
+		       "DST="#raddr"-SRC="#laddr"-RP="#rport"-LP="#lport); \
+		zassert_true(0, "exiting");				\
 	}
 
 #define UNREGISTER(ud)							\
@@ -457,7 +540,7 @@ static bool run_tests(void)
 	if (ret) {							\
 		printk("UDP unregister %p failed (%d)\n", ud->handle,	\
 		       ret);						\
-		return false;						\
+		zassert_true(0, "exiting");				\
 	}
 
 #define TEST_IPV6_OK(ud, raddr, laddr, rport, lport)			\
@@ -466,7 +549,16 @@ static bool run_tests(void)
 	if (!st) {							\
 		printk("%d: UDP test \"%s\" fail\n", __LINE__,		\
 		       ud->test);					\
-		return false;						\
+		zassert_true(0, "exiting");				\
+	}
+
+#define TEST_IPV6_LONG_OK(ud, raddr, laddr, rport, lport)		\
+	st = send_ipv6_udp_long_msg(iface, raddr, laddr, rport, lport, ud, \
+			       false);					\
+	if (!st) {							\
+		printk("%d: UDP long test \"%s\" fail\n", __LINE__,	\
+		       ud->test);					\
+		zassert_true(0, "exiting");				\
 	}
 
 #define TEST_IPV4_OK(ud, raddr, laddr, rport, lport)			\
@@ -475,30 +567,32 @@ static bool run_tests(void)
 	if (!st) {							\
 		printk("%d: UDP test \"%s\" fail\n", __LINE__,		\
 		       ud->test);					\
-		return false;						\
+		zassert_true(0, "exiting");				\
 	}
 
 #define TEST_IPV6_FAIL(ud, raddr, laddr, rport, lport)			\
 	st = send_ipv6_udp_msg(iface, raddr, laddr, rport, lport, ud,	\
 			       true);					\
-	if (st) {							\
+	if (!st) {							\
 		printk("%d: UDP neg test \"%s\" fail\n", __LINE__,	\
 		       ud->test);					\
-		return false;						\
+		zassert_true(0, "exiting");				\
 	}
 
 #define TEST_IPV4_FAIL(ud, raddr, laddr, rport, lport)			\
 	st = send_ipv4_udp_msg(iface, raddr, laddr, rport, lport, ud,	\
 			       true);					\
-	if (st) {							\
+	if (!st) {							\
 		printk("%d: UDP neg test \"%s\" fail\n", __LINE__,	\
 		       ud->test);					\
-		return false;						\
+		zassert_true(0, "exiting");				\
 	}
 
 	ud = REGISTER(AF_INET6, &any_addr6, &any_addr6, 1234, 4242);
 	TEST_IPV6_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
 	TEST_IPV6_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
+	TEST_IPV6_LONG_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
+	TEST_IPV6_LONG_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
 	TEST_IPV6_FAIL(ud, &in6addr_peer, &in6addr_my, 1234, 61400);
 	TEST_IPV6_FAIL(ud, &in6addr_peer, &in6addr_my, 1234, 61400);
 	UNREGISTER(ud);
@@ -520,6 +614,8 @@ static bool run_tests(void)
 	ud = REGISTER(AF_INET6, NULL, &any_addr6, 1234, 4242);
 	TEST_IPV6_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
 	TEST_IPV6_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
+	TEST_IPV6_LONG_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
+	TEST_IPV6_LONG_OK(ud, &in6addr_peer, &in6addr_my, 1234, 4242);
 	TEST_IPV6_FAIL(ud, &in6addr_peer, &in6addr_my, 1234, 61400);
 	TEST_IPV6_FAIL(ud, &in6addr_peer, &in6addr_my, 1234, 61400);
 	UNREGISTER(ud);
@@ -548,6 +644,7 @@ static bool run_tests(void)
 	ud = REGISTER(AF_UNSPEC, NULL, NULL, 0, 0);
 	TEST_IPV4_OK(ud, &in4addr_peer, &in4addr_my, 12345, 42421);
 	TEST_IPV6_OK(ud, &in6addr_peer, &in6addr_my, 12345, 42421);
+	TEST_IPV6_LONG_OK(ud, &in6addr_peer, &in6addr_my, 12345, 42421);
 
 	/* Remote addr same as local addr, these two will never match */
 	REGISTER(AF_INET6, &my_addr6, NULL, 1234, 4242);
@@ -556,47 +653,27 @@ static bool run_tests(void)
 	/* IPv4 remote addr and IPv6 remote addr, impossible combination */
 	REGISTER_FAIL(&my_addr4, &my_addr6, 1234, 4242);
 
-	if (fail) {
-		printk("Tests failed\n");
-		return false;
-	}
+	/**TESTPOINT: Check if tests passed*/
+	zassert_false(fail, "Tests failed");
 
 	i--;
 	while (i) {
 		ret = net_udp_unregister(handlers[i]);
 		if (ret < 0 && ret != -ENOENT) {
 			printk("Cannot unregister udp %d\n", i);
-			return false;
+			zassert_true(0, "exiting");
 		}
 
 		i--;
 	}
 
-	if (!(net_udp_unregister(NULL) < 0)) {
-		printk("Unregister udp failed\n");
-		return false;
-	}
-
-	printk("Network UDP checks passed\n");
-	return true;
+	zassert_true((net_udp_unregister(NULL) < 0), "Unregister udp failed");
+	zassert_false(test_failed, "udp tests failed");
 }
 
-void main_thread(void)
+void test_main(void)
 {
-	if (run_tests()) {
-		TC_END_REPORT(TC_PASS);
-	} else {
-		TC_END_REPORT(TC_FAIL);
-	}
-}
-
-#define STACKSIZE 2000
-char __noinit __stack thread_stack[STACKSIZE];
-static struct k_thread thread_data;
-
-void main(void)
-{
-	k_thread_create(&thread_data, thread_stack, STACKSIZE,
-			(k_thread_entry_t)main_thread,
-			NULL, NULL, NULL, K_PRIO_COOP(7), 0, 0);
+	ztest_test_suite(test_udp_fn,
+		ztest_unit_test(test_udp));
+	ztest_run_test_suite(test_udp_fn);
 }

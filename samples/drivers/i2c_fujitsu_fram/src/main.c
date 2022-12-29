@@ -6,26 +6,20 @@
 
 #include <errno.h>
 #include <zephyr.h>
-#include <misc/printk.h>
+#include <sys/printk.h>
 #include <device.h>
-#include <i2c.h>
-
-#if defined(CONFIG_SOC_QUARK_SE_C1000_SS)
-#define I2C_DEV CONFIG_I2C_SS_0_NAME
-#else
-#define I2C_DEV CONFIG_I2C_0_NAME
-#endif
+#include <drivers/i2c.h>
 
 /**
- * @file Sample app using the Fujitsu MB85RC256V FRAM through ARC I2C.
+ * @file Sample app using the Fujitsu MB85RC256V FRAM through I2C.
  */
 
 #define FRAM_I2C_ADDR	0x50
 
-static int write_bytes(struct device *i2c_dev, u16_t addr,
-		       u8_t *data, u32_t num_bytes)
+static int write_bytes(const struct device *i2c_dev, uint16_t addr,
+		       uint8_t *data, uint32_t num_bytes)
 {
-	u8_t wr_addr[2];
+	uint8_t wr_addr[2];
 	struct i2c_msg msgs[2];
 
 	/* FRAM address */
@@ -36,7 +30,7 @@ static int write_bytes(struct device *i2c_dev, u16_t addr,
 
 	/* Send the address to write to */
 	msgs[0].buf = wr_addr;
-	msgs[0].len = 2;
+	msgs[0].len = 2U;
 	msgs[0].flags = I2C_MSG_WRITE;
 
 	/* Data to be written, and STOP after this. */
@@ -47,10 +41,10 @@ static int write_bytes(struct device *i2c_dev, u16_t addr,
 	return i2c_transfer(i2c_dev, &msgs[0], 2, FRAM_I2C_ADDR);
 }
 
-static int read_bytes(struct device *i2c_dev, u16_t addr,
-		      u8_t *data, u32_t num_bytes)
+static int read_bytes(const struct device *i2c_dev, uint16_t addr,
+		      uint8_t *data, uint32_t num_bytes)
 {
-	u8_t wr_addr[2];
+	uint8_t wr_addr[2];
 	struct i2c_msg msgs[2];
 
 	/* Now try to read back from FRAM */
@@ -63,7 +57,7 @@ static int read_bytes(struct device *i2c_dev, u16_t addr,
 
 	/* Send the address to read from */
 	msgs[0].buf = wr_addr;
-	msgs[0].len = 2;
+	msgs[0].len = 2U;
 	msgs[0].flags = I2C_MSG_WRITE;
 
 	/* Read from device. STOP after this. */
@@ -76,14 +70,13 @@ static int read_bytes(struct device *i2c_dev, u16_t addr,
 
 void main(void)
 {
-	struct device *i2c_dev;
-	u8_t cmp_data[16];
-	u8_t data[16];
+	const struct device *i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
+	uint8_t cmp_data[16];
+	uint8_t data[16];
 	int i, ret;
 
-	i2c_dev = device_get_binding(I2C_DEV);
-	if (!i2c_dev) {
-		printk("I2C: Device driver not found.\n");
+	if (!device_is_ready(i2c_dev)) {
+		printk("I2C: Device is not ready.\n");
 		return;
 	}
 

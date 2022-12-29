@@ -8,7 +8,7 @@
 
 
 #include <kernel.h>
-#include <misc/printk.h>
+#include <sys/printk.h>
 #include <device.h>
 #include <init.h>
 
@@ -26,7 +26,7 @@ static int ram_console_out(int character)
 	return character;
 }
 
-static int ram_console_init(struct device *d)
+static int ram_console_init(const struct device *d)
 {
 	ARG_UNUSED(d);
 	__printk_hook_install(ram_console_out);
@@ -35,4 +35,4 @@ static int ram_console_init(struct device *d)
 	return 0;
 }
 
-SYS_INIT(ram_console_init, PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
+SYS_INIT(ram_console_init, PRE_KERNEL_1, CONFIG_CONSOLE_INIT_PRIORITY);

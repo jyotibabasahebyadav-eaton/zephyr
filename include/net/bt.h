@@ -9,10 +9,14 @@
  * @brief Bluetooth L2 stack public header
  */
 
-#ifndef __BT_H__
-#define __BT_H__
+#ifndef ZEPHYR_INCLUDE_NET_BT_H_
+#define ZEPHYR_INCLUDE_NET_BT_H_
 
 #include <net/net_mgmt.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Management part definitions */
 
@@ -24,10 +28,16 @@
 #define _NET_BT_EVENT	(_NET_BT_BASE | NET_MGMT_EVENT_BIT)
 
 enum net_request_bt_cmd {
-	NET_REQUEST_BT_CMD_CONNECT = 1,
+	NET_REQUEST_BT_CMD_ADVERTISE = 1,
+	NET_REQUEST_BT_CMD_CONNECT,
 	NET_REQUEST_BT_CMD_SCAN,
 	NET_REQUEST_BT_CMD_DISCONNECT,
 };
+
+#define NET_REQUEST_BT_ADVERTISE				\
+	(_NET_BT_BASE | NET_REQUEST_BT_CMD_ADVERTISE)
+
+NET_MGMT_DEFINE_REQUEST_HANDLER(NET_REQUEST_BT_ADVERTISE);
 
 #define NET_REQUEST_BT_CONNECT					\
 	(_NET_BT_BASE | NET_REQUEST_BT_CMD_CONNECT)
@@ -51,4 +61,8 @@ enum net_event_bt_cmd {
 
 NET_MGMT_DEFINE_REQUEST_HANDLER(NET_REQUEST_BT_DISCONNECT);
 
-#endif /* __BT_H__ */
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ZEPHYR_INCLUDE_NET_BT_H_ */
